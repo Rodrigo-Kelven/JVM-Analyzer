@@ -169,9 +169,4 @@ Monitora processos JVM via `/proc` do Linux com dashboard interativo e exportaç
     // Refresh rate: sleep(2) = 2 segundos
     // Thresholds editáveis em update_metrics()
 
-### Compilação com Flags
-    # Produção
-    gcc -O3 -DNDEBUG jvm_analyzer.c -o jvma
-
-    # Debug
-    gcc -g -Wall -Wextra -fsanitize=address jvm_analyzer.c -o jvma
+#### Contribuições serão sempre bem vindas!
