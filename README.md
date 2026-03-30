@@ -87,9 +87,7 @@ Monitora processos JVM via `/proc` do Linux com dashboard interativo e exportaç
 
 ## Compilação
 
-    gcc -O2 -Wall jvm_analyzer.c -o jvma
-    ou
-    clang -O2 -Wall jvm_analyzer.c -o jvma
+    gcc -O2 -w -o jvm_analyzer jvm_analyzer.c -lm
 
 
 ## Uso
