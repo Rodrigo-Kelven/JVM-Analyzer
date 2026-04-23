@@ -344,6 +344,6 @@ JVM-Analyzer/
 - Análise de threads via `/proc/[pid]/task`
 - Exportação JSON simples
 
-## Autores:
+## Autores
   - [@Rodrigo Kelven](https://github.com/Rodrigo-Kelven)
   - [@Tiago Oliveira](https://github.com/Tiago-Dev0708)
