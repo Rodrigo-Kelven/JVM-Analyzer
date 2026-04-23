@@ -343,3 +343,7 @@ JVM-Analyzer/
 - Métricas de memória simuladas (valores aleatórios)
 - Análise de threads via `/proc/[pid]/task`
 - Exportação JSON simples
+
+## Autores:
+  - [@Rodrigo Kelven](https://github.com/Rodrigo-Kelven)
+  - [@Tiago Oliveira](https://github.com/Tiago-Dev0708)
