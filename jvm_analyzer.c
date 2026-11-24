@@ -41,6 +41,8 @@
 #include <stdarg.h>
 #include <termios.h>
 #include <locale.h>
+#include <poll.h>
+#include <limits.h>
 
 /* =========================================================================
  * VERSION + CONSTANTS
@@ -50,6 +52,7 @@
 #define MAX_ALERTS      24
 #define MAX_DISCOVERED  48
 #define DEFAULT_ITVL_MS 2000
+#define NOTIFY_TTL_SEC  3
 #define FBUF_SIZE       (128 * 1024)
 
 /* Alert thresholds */
@@ -156,9 +159,9 @@ typedef struct {
 /* =========================================================================
  * GLOBALS
  * ========================================================================= */
-static jvm_t           g_jvm        = {0};
-static volatile int    g_running    = 1;
-static volatile int    g_resize     = 0;
+static jvm_t                 g_jvm        = {0};
+static volatile sig_atomic_t g_running    = 1;
+static volatile sig_atomic_t g_resize     = 0;
 static int             g_itvl_ms    = DEFAULT_ITVL_MS;
 static char            g_export[256]= "./exports";
 static struct termios  g_orig_term;
@@ -167,6 +170,35 @@ static int             g_term_h     = 24;
 static char            g_fbuf[FBUF_SIZE];
 static int             g_fbuf_pos   = 0;
 static int             g_term_saved = 0;
+/* Leitura de teclas: desativada quando stdin não é TTY ou quando read/poll
+ * reporta EOF/POLLHUP. Nesse estado o loop apenas dorme o restante do
+ * intervalo, sem girar CPU. */
+static int             g_keys_enabled = 1;
+
+/* Notificação de export: texto + timestamp, sem sleeps nem IO no terminal.
+ * O footer desenha enquanto now < g_notify_until; o loop de input continua vivo. */
+static char            g_notify_msg[512] = {0};
+static time_t          g_notify_at      = 0;
+static time_t          g_notify_until   = 0;
+
+static void notify_clear(void) {
+    g_notify_msg[0] = '\0';
+    g_notify_at = 0;
+    g_notify_until = 0;
+}
+
+static void notify_set(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_notify_msg, sizeof(g_notify_msg), fmt, ap);
+    va_end(ap);
+    g_notify_at = time(NULL);
+    g_notify_until = g_notify_at + NOTIFY_TTL_SEC;
+}
+
+static int notify_active(time_t now) {
+    return g_notify_msg[0] != '\0' && now >= g_notify_at && now < g_notify_until;
+}
 
 /* =========================================================================
  * FRAME BUFFER (atomic rendering, no flicker)
@@ -230,13 +262,17 @@ static void term_get_size(void) {
 
 static void term_raw(void) {
     struct termios raw;
-    tcgetattr(STDIN_FILENO, &g_orig_term);
-    g_term_saved = 1;
-    raw = g_orig_term;
-    raw.c_lflag &= ~(ICANON | ECHO);
-    raw.c_cc[VMIN]  = 0;
-    raw.c_cc[VTIME] = 1;   /* 100ms read timeout */
-    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+
+    g_keys_enabled = isatty(STDIN_FILENO) ? 1 : 0;
+    if (g_keys_enabled) {
+        tcgetattr(STDIN_FILENO, &g_orig_term);
+        g_term_saved = 1;
+        raw = g_orig_term;
+        raw.c_lflag &= ~(ICANON | ECHO);
+        raw.c_cc[VMIN]  = 0;
+        raw.c_cc[VTIME] = 0;   /* poll() decide; read() nunca bloqueia */
+        tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    }
     write(STDOUT_FILENO, "\033[?25l", 6); /* hide cursor */
     write(STDOUT_FILENO, "\033[2J\033[H", 7); /* clear screen */
 }
@@ -248,11 +284,67 @@ static void term_restore(void) {
     write(STDOUT_FILENO, "\033[0m\033[2J\033[H", 10);
 }
 
-/* Read one keypress without blocking (timeout ~100ms) */
-static int term_read_key(void) {
-    char ch;
-    int n = (int)read(STDIN_FILENO, &ch, 1);
-    return (n == 1) ? (unsigned char)ch : -1;
+/* Timing do loop: deadline absoluto por volta (CLOCK_MONOTONIC) e restante
+ * recalculado a cada passo. Nada de "elapsed += 100": o próximo frame não
+ * herda o erro de arredondamento do anterior. */
+static void interval_deadline(struct timespec *deadline, int interval_ms)
+{
+    clock_gettime(CLOCK_MONOTONIC, deadline);
+    deadline->tv_sec  += interval_ms / 1000;
+    deadline->tv_nsec += (long)(interval_ms % 1000) * 1000000L;
+    if (deadline->tv_nsec >= 1000000000L) {
+        deadline->tv_sec++;
+        deadline->tv_nsec -= 1000000000L;
+    }
+}
+
+/* Milissegundos até o deadline, arredondados para cima para não acordar
+ * cedo; 0 quando o prazo já passou. */
+static int deadline_remaining_ms(const struct timespec *deadline)
+{
+    struct timespec now;
+    long long rem_ns;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    rem_ns = ((long long)deadline->tv_sec - now.tv_sec) * 1000000000LL
+           + ((long long)deadline->tv_nsec - now.tv_nsec);
+    if (rem_ns <= 0) return 0;
+    rem_ns = (rem_ns + 999999LL) / 1000000LL;
+    return (rem_ns > INT_MAX) ? INT_MAX : (int)rem_ns;
+}
+
+/* Espera no máximo timeout_ms e lê 1 byte se ele chegar. Sem TTY (ou após
+ * EOF/POLLHUP) a leitura é desativada e o restante do intervalo é apenas
+ * dormido com poll(NULL, 0, timeout): nenhuma volta ocupada de CPU. */
+static int term_read_key(int timeout_ms)
+{
+    struct pollfd pfd;
+    int rc;
+
+    if (timeout_ms <= 0) return -1;
+
+    if (!g_keys_enabled) {
+        poll(NULL, 0, timeout_ms);
+        return -1;
+    }
+
+    pfd.fd      = STDIN_FILENO;
+    pfd.events  = POLLIN;
+    pfd.revents = 0;
+    rc = poll(&pfd, 1, timeout_ms);
+    if (rc <= 0) return -1; /* timeout ou EINTR */
+
+    if (pfd.revents & POLLIN) {
+        unsigned char ch;
+        ssize_t n = read(STDIN_FILENO, &ch, 1);
+        if (n == 1) return (int)ch;
+        if (n == 0) g_keys_enabled = 0; /* EOF */
+        else if (n < 0 && errno != EINTR && errno != EAGAIN) g_keys_enabled = 0;
+    }
+    if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))
+        g_keys_enabled = 0; /* desativa leitura após HUP/erro */
+
+    return -1;
 }
 
 /* =========================================================================
@@ -261,6 +353,22 @@ static int term_read_key(void) {
 static void sig_handler(int s) {
     if (s == SIGINT || s == SIGTERM) { g_running = 0; }
     if (s == SIGWINCH) { g_resize = 1; }
+}
+
+/* Instalação explícita das três flags: máscara vazia e SA_RESTART. poll()
+ * não é reiniciado por SA_RESTART (EINTR), então o loop continua vendo
+ * g_running/g_resize imediatamente após o sinal. */
+static void signals_init(void) {
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sig_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+
+    sigaction(SIGINT,   &sa, NULL);
+    sigaction(SIGTERM,  &sa, NULL);
+    sigaction(SIGWINCH, &sa, NULL);
 }
 
 /* =========================================================================
@@ -632,35 +740,141 @@ static void ensure_export_dir(void) {
     if (stat(g_export, &st) != 0) mkdir(g_export, 0755);
 }
 
+/* Escapa uma string C para uso entre aspas em JSON. Cada byte pode ocupar
+ * até 6 bytes na saída (\u00XX), então o chamador deve reservar
+ * 6 * strlen(s) + 1 bytes. A truncagem por falta de espaço nunca corta uma
+ * sequência de escape ao meio. */
+static void json_escape(const char *s, char *out, size_t cap)
+{
+    size_t o = 0;
+
+    if (cap == 0) return;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        char ubuf[7];          /* \u00XX + NUL */
+        const char *add = NULL;
+        size_t need;
+
+        switch (*p) {
+        case '"':  add = "\\\""; break;
+        case '\\': add = "\\\\"; break;
+        case '\n': add = "\\n"; break;
+        case '\t': add = "\\t"; break;
+        case '\r': add = "\\r"; break;
+        default:
+            if (*p < 0x20) {
+                snprintf(ubuf, sizeof(ubuf), "\\u%04x", (unsigned)*p);
+                add = ubuf;
+            }
+            break;
+        }
+        need = add ? strlen(add) : 1;
+        if (o + need + 1 > cap) break;
+        if (add) memcpy(out + o, add, need);
+        else     out[o] = (char)*p;
+        o += need;
+    }
+    out[o] = '\0';
+}
+
+static void export_report_io(const char *action, const char *path)
+{
+    int e = errno;
+    fprintf(stderr, "JVMA: falha ao %s %s: %s\n", action, path,
+            e ? strerror(e) : "erro de E/S");
+}
+
+/* fprintf com verificação explícita do retorno; falha é reportada uma vez. */
+static int export_print(FILE *f, const char *path, const char *fmt, ...)
+{
+    va_list ap;
+    int rc;
+
+    errno = 0;
+    va_start(ap, fmt);
+    rc = vfprintf(f, fmt, ap);
+    va_end(ap);
+    if (rc < 0 || ferror(f)) {
+        export_report_io("escrever", path);
+        return 0;
+    }
+    return 1;
+}
+
+/* Decimal de exportação sempre com ponto; demais categorias intactas. */
+static void export_numeric_push(char *saved, size_t cap)
+{
+    const char *cur = setlocale(LC_NUMERIC, NULL);
+    snprintf(saved, cap, "%s", cur ? cur : "C");
+    setlocale(LC_NUMERIC, "C");
+}
+
+static void export_numeric_pop(const char *saved)
+{
+    setlocale(LC_NUMERIC, saved);
+}
+
 static void export_json(const jvm_t *j) {
     ensure_export_dir();
     char path[512];
     time_t now = time(NULL);
     snprintf(path, sizeof(path), "%s/jvma_%d_%ld.json", g_export, j->pid, now);
+    errno = 0;
     FILE *f = fopen(path, "w");
-    if (!f) return;
+    if (!f) {
+        export_report_io("abrir", path);
+        return;                 /* TUI permanece intacta */
+    }
+
+    /* Mantém o limite de 300 bytes do baseline antes de escapar. */
+    char cmd_raw[301];
+    char cmd_escaped[300 * 6 + 1];
+    char gc_escaped[sizeof(j->gc_type) * 6 + 1];
+    snprintf(cmd_raw, sizeof(cmd_raw), "%.300s", j->cmdline);
+    json_escape(cmd_raw, cmd_escaped, sizeof(cmd_escaped));
+    json_escape(j->gc_type, gc_escaped, sizeof(gc_escaped));
+
+    char saved_numeric[64];
+    export_numeric_push(saved_numeric, sizeof(saved_numeric));
+
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
-    fprintf(f, "{\n  \"jvma_version\": \"%s\",\n  \"timestamp\": \"%s\",\n", JVMA_VERSION, ts);
-    fprintf(f, "  \"unix_ts\": %ld,\n  \"pid\": %d,\n  \"gc_type\": \"%s\",\n", now, j->pid, j->gc_type);
-    fprintf(f, "  \"uptime_s\": %lu,\n  \"cmdline\": \"%.300s\",\n", j->uptime_s, j->cmdline);
-    fprintf(f, "  \"cpu_pct\": %.2f,\n", j->cpu_pct);
-    fprintf(f, "  \"memory\": { \"rss_mb\": %.1f, \"vsz_mb\": %.1f, \"swap_mb\": %.1f,\n"
-               "    \"pss_mb\": %.1f, \"heap_est_mb\": %.1f, \"anon_mb\": %.1f },\n",
-            j->mem.rss_kb/1024.0, j->mem.vsz_kb/1024.0, j->mem.swap_kb/1024.0,
-            j->mem.pss_kb/1024.0, j->mem.java_heap_kb/1024.0, j->mem.anon_kb/1024.0);
-    fprintf(f, "  \"threads\": { \"total\": %d, \"virtual\": %d, \"platform\": %d,\n"
-               "    \"daemon\": %d, \"runnable\": %d, \"waiting\": %d, \"blocked\": %d, \"zombie\": %d },\n",
-            j->thr.total, j->thr.virt, j->thr.platform,
-            j->thr.daemon, j->thr.runnable, j->thr.waiting, j->thr.blocked, j->thr.zombie);
-    fprintf(f, "  \"fds\": { \"open\": %d, \"limit\": %d },\n", j->fd_count, j->fd_limit);
-    fprintf(f, "  \"gc_pause_ms\": %.1f,\n  \"alerts\": %d\n}\n", j->gc_pause_ms, j->nalerts);
-    fclose(f);
-    /* Flash notification inline */
-    term_restore();
-    printf("\033[32;1m JSON saved: %s\033[0m\n", path);
-    usleep(800000);
-    term_raw();
+    if (!export_print(f, path, "{\n  \"jvma_version\": \"%s\",\n  \"timestamp\": \"%s\",\n",
+                      JVMA_VERSION, ts)) goto write_failed;
+    if (!export_print(f, path, "  \"unix_ts\": %ld,\n  \"pid\": %d,\n  \"gc_type\": \"%s\",\n",
+                      now, j->pid, gc_escaped)) goto write_failed;
+    if (!export_print(f, path, "  \"uptime_s\": %lu,\n  \"cmdline\": \"%s\",\n",
+                      j->uptime_s, cmd_escaped)) goto write_failed;
+    if (!export_print(f, path, "  \"cpu_pct\": %.2f,\n", j->cpu_pct)) goto write_failed;
+    if (!export_print(f, path, "  \"memory\": { \"rss_mb\": %.1f, \"vsz_mb\": %.1f, \"swap_mb\": %.1f,\n"
+                               "    \"pss_mb\": %.1f, \"heap_est_mb\": %.1f, \"anon_mb\": %.1f },\n",
+                      j->mem.rss_kb/1024.0, j->mem.vsz_kb/1024.0, j->mem.swap_kb/1024.0,
+                      j->mem.pss_kb/1024.0, j->mem.java_heap_kb/1024.0,
+                      j->mem.anon_kb/1024.0)) goto write_failed;
+    if (!export_print(f, path, "  \"threads\": { \"total\": %d, \"virtual\": %d, \"platform\": %d,\n"
+                               "    \"daemon\": %d, \"runnable\": %d, \"waiting\": %d, \"blocked\": %d, \"zombie\": %d },\n",
+                      j->thr.total, j->thr.virt, j->thr.platform,
+                      j->thr.daemon, j->thr.runnable, j->thr.waiting,
+                      j->thr.blocked, j->thr.zombie)) goto write_failed;
+    if (!export_print(f, path, "  \"fds\": { \"open\": %d, \"limit\": %d },\n",
+                      j->fd_count, j->fd_limit)) goto write_failed;
+    if (!export_print(f, path, "  \"gc_pause_ms\": %.1f,\n  \"alerts\": %d\n}\n",
+                      j->gc_pause_ms, j->nalerts)) goto write_failed;
+
+    errno = 0;
+    if (fclose(f) != 0) {
+        export_report_io("fechar", path);
+        export_numeric_pop(saved_numeric);
+        return;
+    }
+    export_numeric_pop(saved_numeric);
+
+    notify_set("JSON saved: %s", path);
+    return;
+
+write_failed:
+    fclose(f);                  /* erro já reportado por export_print */
+    export_numeric_pop(saved_numeric);
+    return;
 }
 
 static void export_csv(const jvm_t *j) {
@@ -668,25 +882,48 @@ static void export_csv(const jvm_t *j) {
     char path[512];
     snprintf(path, sizeof(path), "%s/jvma_%d.csv", g_export, j->pid);
     int write_hdr = (access(path, F_OK) != 0);
+    errno = 0;
     FILE *f = fopen(path, "a");
-    if (!f) return;
-    if (write_hdr)
-        fprintf(f, "timestamp,pid,cpu_pct,rss_mb,vsz_mb,swap_mb,pss_mb,"
-                   "heap_est_mb,anon_mb,threads,runnable,waiting,blocked,"
-                   "zombie,virtual,daemon,fd_count,fd_limit,gc_type,gc_pause_ms,uptime_s\n");
-    fprintf(f, "%ld,%d,%.2f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,"
-               "%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%.1f,%lu\n",
-        time(NULL), j->pid, j->cpu_pct,
-        j->mem.rss_kb/1024.0, j->mem.vsz_kb/1024.0, j->mem.swap_kb/1024.0,
-        j->mem.pss_kb/1024.0, j->mem.java_heap_kb/1024.0, j->mem.anon_kb/1024.0,
-        j->thr.total, j->thr.runnable, j->thr.waiting, j->thr.blocked, j->thr.zombie,
-        j->thr.virt, j->thr.daemon, j->fd_count, j->fd_limit,
-        j->gc_type, j->gc_pause_ms, j->uptime_s);
+    if (!f) {
+        export_report_io("abrir", path);
+        return;
+    }
+
+    char saved_numeric[64];
+    export_numeric_push(saved_numeric, sizeof(saved_numeric));
+
+    if (write_hdr) {
+        if (!export_print(f, path, "timestamp,pid,cpu_pct,rss_mb,vsz_mb,swap_mb,pss_mb,"
+                                   "heap_est_mb,anon_mb,threads,runnable,waiting,blocked,"
+                                   "zombie,virtual,daemon,fd_count,fd_limit,gc_type,gc_pause_ms,uptime_s\n"))
+            goto write_failed;
+    }
+    if (!export_print(f, path, "%ld,%d,%.2f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,"
+                              "%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%.1f,%lu\n",
+                      time(NULL), j->pid, j->cpu_pct,
+                      j->mem.rss_kb/1024.0, j->mem.vsz_kb/1024.0,
+                      j->mem.swap_kb/1024.0, j->mem.pss_kb/1024.0,
+                      j->mem.java_heap_kb/1024.0, j->mem.anon_kb/1024.0,
+                      j->thr.total, j->thr.runnable, j->thr.waiting,
+                      j->thr.blocked, j->thr.zombie, j->thr.virt, j->thr.daemon,
+                      j->fd_count, j->fd_limit, j->gc_type, j->gc_pause_ms,
+                      j->uptime_s)) goto write_failed;
+
+    errno = 0;
+    if (fclose(f) != 0) {
+        export_report_io("fechar", path);
+        export_numeric_pop(saved_numeric);
+        return;
+    }
+    export_numeric_pop(saved_numeric);
+
+    notify_set("CSV appended: %s", path);
+    return;
+
+write_failed:
     fclose(f);
-    term_restore();
-    printf("\033[32;1m CSV appended: %s\033[0m\n", path);
-    usleep(800000);
-    term_raw();
+    export_numeric_pop(saved_numeric);
+    return;
 }
 
 /* =========================================================================
@@ -1012,12 +1249,21 @@ static int panel_alerts(const jvm_t *j, int row, int col, int w) {
 }
 
 static void draw_footer(const jvm_t *j) {
+    /* Mesmo fb_move para as duas variantes: a linha de status nunca ganha
+     * uma segunda posição enquanto a notificação está ativa. */
     fb_move(g_term_h-1, 0);
-    fb_fg(CL_DIM);
-    fb_printf(" [Q]Quit  [P]%s  [E]JSON  [C]CSV  [H]Help  [+/-]Speed  Int:%ds",
-              j->paused ? "Resume" : "Pause", g_itvl_ms/1000);
+    if (notify_active(time(NULL))) {
+        int avail = g_term_w - 1;
+        fb_fg(CL_OK); fb_bold();
+        if (avail > 0) fb_printf("%.*s", avail, g_notify_msg);
+    } else {
+        fb_fg(CL_DIM);
+        fb_printf(" [Q]Quit  [P]%s  [E]JSON  [C]CSV  [H]Help  [+/-]Speed  Int:%ds",
+                  j->paused ? "Resume" : "Pause", g_itvl_ms/1000);
+    }
     fb_eol();
     fb_reset_attr();
+
     if (j->paused) {
         fb_move(g_term_h-1, g_term_w-12);
         fb_fg(CL_WARN); fb_bold();
@@ -1078,14 +1324,35 @@ static void render_help(void) {
                "           Press any key to close");
 
     fb_flush();
-    /* Block until keypress */
+    /* Espera por tecla interrompível: VMIN=0/VTIME=0 mantêm read() não
+     * bloqueante e poll() dorme em fatias curtas verificando g_running.
+     * Qualquer byte (ou EOF/HUP) fecha o help, como antes. */
     struct termios bl;
-    tcgetattr(STDIN_FILENO, &bl);
-    struct termios raw = bl;
-    raw.c_cc[VMIN] = 1; raw.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
-    char ch; read(STDIN_FILENO, &ch, 1);
-    tcsetattr(STDIN_FILENO, TCSANOW, &bl);
+    int term_saved = (tcgetattr(STDIN_FILENO, &bl) == 0);
+    if (term_saved) {
+        struct termios raw = bl;
+        raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 0;
+        tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    }
+
+    while (g_running) {
+        struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN, .revents = 0 };
+        int rc = poll(&pfd, 1, 25);
+        if (rc < 0) {
+            if (errno == EINTR) continue; /* sinal já atualizou g_running */
+            break;
+        }
+        if (rc == 0) continue;            /* sem tecla: reavalia g_running */
+        if (pfd.revents & POLLIN) {
+            unsigned char ch;
+            ssize_t n = read(STDIN_FILENO, &ch, 1);
+            if (n == 1 || n == 0) break;  /* qualquer tecla ou EOF fecha */
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) break;
+    }
+    if (term_saved) tcsetattr(STDIN_FILENO, TCSANOW, &bl);
 }
 
 /* =========================================================================
@@ -1140,8 +1407,8 @@ static int handle_key(jvm_t *j, int key) {
     switch (key) {
     case 'q': case 'Q': g_running = 0; return 0;
     case 'p': case 'P': j->paused = !j->paused; break;
-    case 'e': case 'E': export_json(j); break;
-    case 'c': case 'C': export_csv(j); break;
+    case 'e': case 'E': export_json(j); render_dashboard(j); break;
+    case 'c': case 'C': export_csv(j); render_dashboard(j); break;
     case 'h': case 'H': render_help(); break;
     case '+': case '=':
         g_itvl_ms -= 500; if (g_itvl_ms < 500) g_itvl_ms = 500; break;
@@ -1204,24 +1471,37 @@ static int show_discovery_menu(const jvm_entry_t *list, int n) {
     return list[sel-1].pid;
 }
 
+/* PID da linha de comando: strtol estrito (sem o "1abc" do atoi). */
+static int parse_pid_arg(const char *s, int *out)
+{
+    char *end;
+    long v;
+
+    if (s == NULL || *s == '\0') return -1;
+    errno = 0;
+    v = strtol(s, &end, 10);
+    if (errno == ERANGE || end == s || *end != '\0') return -1;
+    if (v < 1 || v > INT_MAX) return -1;
+    *out = (int)v;
+    return 0;
+}
+
 /* =========================================================================
  * MAIN
  * ========================================================================= */
 int main(int argc, char *argv[]) {
     setlocale(LC_ALL, "");
-    signal(SIGINT,   sig_handler);
-    signal(SIGTERM,  sig_handler);
-    signal(SIGWINCH, sig_handler);
+    /* decimal com ponto em JSON/CSV; hora e demais categorias seguem o ambiente */
+    signals_init();
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
 
     int pid = 0;
-    if (argc >= 2) pid = atoi(argv[1]);
-    if (argc >= 3) strncpy(g_export, argv[2], sizeof(g_export)-1);
-
-    if (pid <= 0 && argc >= 2) {
-        fprintf(stderr, "JVMA: invalid PID '%s'\n", argv[1]);
+    if (argc >= 2 && parse_pid_arg(argv[1], &pid) != 0) {
+        fprintf(stderr, "JVMA: invalid PID '%s' (expected integer 1..%d)\n",
+                argv[1], INT_MAX);
         return 1;
     }
+    if (argc >= 3) strncpy(g_export, argv[2], sizeof(g_export)-1);
 
     /* Discovery mode */
     if (pid == 0) {
@@ -1249,6 +1529,7 @@ int main(int argc, char *argv[]) {
 
     /* Initialize state */
     memset(&g_jvm, 0, sizeof(g_jvm));
+    notify_clear();
     g_jvm.pid = pid;
     g_jvm.first_sample = 1;
     g_jvm.gc_pause_ms = 8.5;
@@ -1276,13 +1557,19 @@ int main(int argc, char *argv[]) {
 
         render_dashboard(&g_jvm);
 
-        int elapsed = 0;
-        while (elapsed < g_itvl_ms && g_running) {
-            int key = term_read_key();
+        struct timespec deadline;
+        interval_deadline(&deadline, g_itvl_ms);
+        while (g_running) {
+            int remaining = deadline_remaining_ms(&deadline);
+            if (remaining <= 0) break;
+
+            int itvl_before = g_itvl_ms;
+            int key = term_read_key(remaining);
             if (key >= 0) {
                 if (!handle_key(&g_jvm, key)) goto done;
+                if (g_itvl_ms != itvl_before)
+                    interval_deadline(&deadline, g_itvl_ms);
             }
-            elapsed += 100;
             if (g_resize) { term_get_size(); g_resize = 0; render_dashboard(&g_jvm); }
         }
     }

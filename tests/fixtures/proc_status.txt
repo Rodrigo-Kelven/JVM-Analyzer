@@ -1,0 +1,9 @@
+Name:	java
+State:	S (sleeping)
+Pid:	4242
+Threads:	12
+VmPeak:	 1048576 kB
+VmSize:	  786432 kB
+VmRSS:	   524288 kB
+RssAnon:	  401408 kB
+VmSwap:	       0 kB
