@@ -58,7 +58,9 @@ Interface colorida com 256 cores, sem dependências externas — apenas C padrã
 | Uptime do processo | `/proc/[pid]/stat` campo `starttime` vs `/proc/uptime` |
 | Tipo de GC | Flags na linha de comando via `/proc/[pid]/cmdline` |
 
-> **Nota:** A pausa de GC (`gc_pause_ms`) é **estimada por simulação** — dado real exigiria agente JMX ou parse de GC log. O campo é sempre exibido com a label `(est)`.
+> **Limitações conhecidas (schema mantido):**
+> - `gc_pause_ms` (JSON/CSV) e `Pause ... (est)` na TUI são **estimativas por simulação**, não medição real: exigiria agente JMX ou parse de GC log. O random walk é o padrão; `--no-sim-gc` / `JVMA_NO_SIM_GC=1` desligam a simulação — nesse caso `gc_pause_ms = 0.0`, nenhum alerta `AL_GC` é emitido e o schema permanece idêntico.
+> - `threads.daemon` (JSON/CSV) e `Daemon` na TUI são **sempre 0**: `/proc/[pid]/status` e `/proc/[pid]/task/*/status` não expõem campo `daemon` (há apenas `State`, `Threads`, `Kthread`, `VirtualThread`, etc.). O campo permanece no schema por compatibilidade.
 
 ---
 
@@ -175,6 +177,15 @@ Se apenas um processo for encontrado, a seleção é automática.
 ```bash
 ./jvma 12345 /var/log/jvma
 ```
+
+### 4. Desligar a simulação de pausa de GC
+
+```bash
+./jvma --no-sim-gc 12345          # flag: prevalece sobre a variável
+JVMA_NO_SIM_GC=1 ./jvma 12345     # variável: apenas o valor exato "1"
+```
+
+Por padrão `gc_pause_ms` é uma estimativa por random walk `(est)` e pode gerar alertas `GC pause ... (est)`. Com a flag ou a variável ativa o campo continua presente com `0.0`, nenhum alerta de GC é gerado e `gc_type` continua detectado normalmente. A flag pode aparecer em qualquer posição da linha de comando; na variável, valores vazios, `0` ou qualquer outro texto **não** ativam o modo. A precedência da CLI é unidirecional (não existe `--sim-gc` para reverter).
 
 ### Encontrando PIDs de JVM
 

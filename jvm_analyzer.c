@@ -43,118 +43,7 @@
 #include <locale.h>
 #include <poll.h>
 #include <limits.h>
-
-/* =========================================================================
- * VERSION + CONSTANTS
- * ========================================================================= */
-#define JVMA_VERSION    "6.0"
-#define HISTORY_LEN     60
-#define MAX_ALERTS      24
-#define MAX_DISCOVERED  48
-#define DEFAULT_ITVL_MS 2000
-#define NOTIFY_TTL_SEC  3
-#define FBUF_SIZE       (128 * 1024)
-
-/* Alert thresholds */
-#define TH_CPU_W     70.0
-#define TH_CPU_C     90.0
-#define TH_GC_W_MS   50.0
-#define TH_GC_C_MS  200.0
-#define TH_THR_W     150
-#define TH_THR_C     300
-#define TH_ZMB_W       3
-#define TH_ZMB_C       8
-#define TH_FD_W      800
-#define TH_FD_C     3000
-
-/* 256-color palette */
-#define CL_BORDER    51   /* bright cyan        — borders, panel titles */
-#define CL_HEALTHY   82   /* bright green       — healthy values        */
-#define CL_WARN     220   /* yellow             — warning values        */
-#define CL_CRIT     196   /* bright red         — critical values       */
-#define CL_LABEL    252   /* light gray         — metric labels         */
-#define CL_VALUE     87   /* light cyan         — numeric values        */
-#define CL_DIM      242   /* medium gray        — secondary text        */
-#define CL_ACCENT   213   /* light magenta      — panel names/accents   */
-#define CL_HDR_BG    23   /* dark teal          — header bar background */
-#define CL_HDR_FG   255   /* white              — header bar text       */
-#define CL_OK        46   /* green              — "all nominal"         */
-
-/* Sparkline characters */
-static const char *SPARK[] = {"▁","▂","▃","▄","▅","▆","▇","█"};
-
-/* =========================================================================
- * DATA STRUCTURES
- * ========================================================================= */
-
-typedef struct {
-    double v[HISTORY_LEN];
-    int    head, count;
-} ring_t;
-
-typedef enum { SEV_WARN=0, SEV_CRIT=1 } sev_t;
-typedef enum {
-    AL_CPU=0, AL_GC, AL_THREAD, AL_ZOMBIE,
-    AL_DEADLOCK, AL_FD, AL_SWAP
-} al_kind_t;
-
-typedef struct {
-    al_kind_t kind;
-    sev_t     sev;
-    double    val;
-    char      msg[128];
-} alert_t;
-
-typedef struct {
-    int total, virt, platform, daemon;
-    int zombie, blocked, runnable, waiting;
-} thr_t;
-
-typedef struct {
-    unsigned long long utime, stime;
-    struct timespec    ts;
-} cpusnap_t;
-
-typedef struct {
-    unsigned long rss_kb, vsz_kb, swap_kb, peak_kb;
-    unsigned long anon_kb, pss_kb;
-    unsigned long java_heap_kb;
-    unsigned long mem_total_kb;
-} mem_t;
-
-typedef struct {
-    int           pid;
-    char          cmdline[512];
-    char          gc_type[48];
-    unsigned long uptime_s;
-
-    cpusnap_t cpu_prev, cpu_cur;
-    double    cpu_pct;
-    int       first_sample;
-
-    mem_t mem;
-    int   heap_ctr;
-
-    thr_t thr;
-    int   fd_count, fd_limit;
-
-    double gc_pause_ms;
-    long   gc_events;
-
-    alert_t alerts[MAX_ALERTS];
-    int     nalerts;
-
-    ring_t h_cpu, h_rss, h_threads;
-
-    int paused;
-} jvm_t;
-
-typedef struct {
-    int  pid;
-    char cmdline[256];
-    char gc_type[32];
-    int  nthr;
-} jvm_entry_t;
+#include "src/jvma_types.h"
 
 /* =========================================================================
  * GLOBALS
@@ -164,11 +53,14 @@ static volatile sig_atomic_t g_running    = 1;
 static volatile sig_atomic_t g_resize     = 0;
 static int             g_itvl_ms    = DEFAULT_ITVL_MS;
 static char            g_export[256]= "./exports";
+/* GC simulado é o padrão; --no-sim-gc / JVMA_NO_SIM_GC=1 desligam o random walk. */
+static int             g_no_sim_gc  = 0;
 static struct termios  g_orig_term;
 static int             g_term_w     = 80;
 static int             g_term_h     = 24;
 static char            g_fbuf[FBUF_SIZE];
 static int             g_fbuf_pos   = 0;
+static int             g_fb_overflow = 0;
 static int             g_term_saved = 0;
 /* Leitura de teclas: desativada quando stdin não é TTY ou quando read/poll
  * reporta EOF/POLLHUP. Nesse estado o loop apenas dorme o restante do
@@ -203,18 +95,74 @@ static int notify_active(time_t now) {
 /* =========================================================================
  * FRAME BUFFER (atomic rendering, no flicker)
  * ========================================================================= */
-static void fb_reset(void)                { g_fbuf_pos = 0; }
+static int g_fb_col = 0;
+
+static void fb_reset(void)                { g_fbuf_pos = 0; g_fb_overflow = 0; g_fb_col = 0; }
 static void fb_flush(void) {
     if (g_fbuf_pos > 0) {
         write(STDOUT_FILENO, g_fbuf, g_fbuf_pos);
         g_fbuf_pos = 0;
     }
+    if (g_fb_overflow) {
+        static int reported = 0;
+        if (!reported) {
+            const char msg[] = "JVMA: frame buffer overflow (fragmento descartado)\n";
+            ssize_t n = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+            (void)n;
+            reported = 1;
+        }
+    }
+}
+static void fb_put_raw(const char *data, int len) {
+    if (len <= 0) return;
+    if (g_fbuf_pos + len < FBUF_SIZE - 2) {
+        memcpy(g_fbuf + g_fbuf_pos, data, len);
+        g_fbuf_pos += len;
+    } else {
+        int avail = FBUF_SIZE - 2 - g_fbuf_pos;
+        if (avail > 0) {
+            memcpy(g_fbuf + g_fbuf_pos, data, avail);
+            g_fbuf_pos += avail;
+        }
+        g_fb_overflow = 1;
+    }
 }
 static void fb_write(const char *s) {
-    int l = (int)strlen(s);
-    if (g_fbuf_pos + l < FBUF_SIZE - 2) {
-        memcpy(g_fbuf + g_fbuf_pos, s, l);
-        g_fbuf_pos += l;
+    /* Limita escrita visível por linha a g_term_w; trunca com segurança e
+     * sinaliza overflow. Sequências ANSI são preservadas. */
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        if (*p == '\033') {
+            const unsigned char *esc = p;
+            p++;
+            if (*p == '[') {
+                p++;
+                while (*p && !(*p >= '@' && *p <= '~')) p++;
+                if (*p) p++; /* terminador */
+            } else if (*p) {
+                p++;
+            }
+            fb_put_raw((const char *)esc, (int)(p - esc));
+            continue;
+        }
+        /* caractere visível: UTF-8 */
+        unsigned int cp = 0;
+        int seq_len = 1;
+        if ((*p & 0x80) == 0) { cp = *p; seq_len = 1; }
+        else if ((*p & 0xE0) == 0xC0 && p[1]) { cp = ((p[0]&0x1F)<<6)|(p[1]&0x3F); seq_len = 2; }
+        else if ((*p & 0xF0) == 0xE0 && p[1] && p[2]) { cp = ((p[0]&0x0F)<<12)|((p[1]&0x3F)<<6)|(p[2]&0x3F); seq_len = 3; }
+        else if ((*p & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) { cp = ((p[0]&0x07)<<18)|((p[1]&0x3F)<<12)|((p[2]&0x3F)<<6)|(p[3]&0x3F); seq_len = 4; }
+        else { seq_len = 1; cp = *p; }
+        /* largura de exibição: 1 para BMP comum usado aqui; 0 para controle */
+        int wch = (cp >= 0x20) ? 1 : 0;
+        if (g_term_w > 0 && g_fb_col + wch > g_term_w) {
+            g_fb_overflow = 1;
+            p += seq_len;
+            continue;
+        }
+        fb_put_raw((const char *)p, seq_len);
+        g_fb_col += wch;
+        p += seq_len;
     }
 }
 static void fb_printf(const char *fmt, ...) {
@@ -226,7 +174,7 @@ static void fb_printf(const char *fmt, ...) {
 }
 
 /* Position cursor (0-based row/col → ANSI 1-based) */
-static void fb_move(int row, int col) { fb_printf("\033[%d;%dH", row+1, col+1); }
+static void fb_move(int row, int col) { g_fb_col = col < 0 ? 0 : col; fb_printf("\033[%d;%dH", row+1, col+1); }
 static void fb_fg(int n)   { fb_printf("\033[38;5;%dm", n); }
 static void fb_bg(int n)   { fb_printf("\033[48;5;%dm", n); }
 static void fb_bold(void)  { fb_write("\033[1m"); }
@@ -406,6 +354,20 @@ static void ring_sparkline(const ring_t *r, char *out, int width) {
 /* =========================================================================
  * /PROC READERS
  * ========================================================================= */
+static int proc_parse_cpu_fields(const char *p, unsigned long long *ut,
+                                 unsigned long long *st)
+{
+    unsigned long long utmp = 0, stmp = 0;
+    /* state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime */
+    int n = sscanf(p, "%*c %*d %*d %*d %*d %*d %*u "
+                      "%*u %*u %*u %*u "
+                      "%llu %llu", &utmp, &stmp);
+    if (n != 2) return -1; /* nunca aceitar valores parciais */
+    *ut = utmp;
+    *st = stmp;
+    return 0;
+}
+
 static int proc_read_cpu(int pid, cpusnap_t *out) {
     char path[64], buf[2048];
     snprintf(path, sizeof(path), "/proc/%d/stat", pid);
@@ -418,10 +380,7 @@ static int proc_read_cpu(int pid, cpusnap_t *out) {
     if (!p) return -1;
     p += 2;
     unsigned long long ut = 0, st = 0;
-    /* state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime */
-    sscanf(p, "%*c %*d %*d %*d %*d %*d %*u "
-              "%*u %*u %*u %*u "
-              "%llu %llu", &ut, &st);
+    if (proc_parse_cpu_fields(p, &ut, &st) != 0) return -1;
     out->utime = ut; out->stime = st;
     clock_gettime(CLOCK_MONOTONIC, &out->ts);
     return 0;
@@ -429,7 +388,13 @@ static int proc_read_cpu(int pid, cpusnap_t *out) {
 
 static double proc_calc_cpu(const cpusnap_t *prev, const cpusnap_t *cur) {
     if (prev->ts.tv_sec == 0) return 0.0;
-    unsigned long long delta = (cur->utime + cur->stime) - (prev->utime + prev->stime);
+    /* PID reaproveitado ou leitura racy pode reiniciar os contadores. */
+    if (prev->utime > ULLONG_MAX - prev->stime ||
+        cur->utime  > ULLONG_MAX - cur->stime) return 0.0;
+    unsigned long long prev_total = prev->utime + prev->stime;
+    unsigned long long cur_total  = cur->utime + cur->stime;
+    if (cur_total < prev_total) return 0.0;
+    unsigned long long delta = cur_total - prev_total;
     double wall = (cur->ts.tv_sec  - prev->ts.tv_sec)
                 + (cur->ts.tv_nsec - prev->ts.tv_nsec) / 1e9;
     if (wall <= 0.0) return 0.0;
@@ -516,6 +481,15 @@ static void proc_read_memtotal(mem_t *m) {
     if (!m->mem_total_kb) m->mem_total_kb = 8UL * 1024 * 1024;
 }
 
+static int proc_parse_fd_limit(const char *line, int *lim) {
+    long long soft = 0;
+    if (sscanf(line, "%*s %*s %*s %lld", &soft) != 1) return -1;
+    if (soft < 0) soft = 0;
+    if (soft > (long long)INT_MAX) soft = (long long)INT_MAX;
+    *lim = (int)soft;
+    return 0;
+}
+
 static void proc_read_fd(int pid, int *cnt, int *lim) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/fd", pid);
@@ -533,8 +507,7 @@ static void proc_read_fd(int pid, int *cnt, int *lim) {
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         if (strstr(line, "open files")) {
-            unsigned long soft;
-            if (sscanf(line, "%*s %*s %*s %lu", &soft) == 1) *lim = (int)soft;
+            (void)proc_parse_fd_limit(line, lim); /* falha mantém o fallback */
             break;
         }
     }
@@ -656,12 +629,17 @@ static void eval_alerts(jvm_t *j) {
         alert_add(j, AL_CPU, SEV_WARN, j->cpu_pct,
                   "CPU high: %.1f%% (threshold %.0f%%)", j->cpu_pct, TH_CPU_W);
 
-    if (j->gc_pause_ms >= TH_GC_C_MS)
-        alert_add(j, AL_GC, SEV_CRIT, j->gc_pause_ms,
-                  "GC pause critical: %.1fms (threshold %.0fms)", j->gc_pause_ms, TH_GC_C_MS);
-    else if (j->gc_pause_ms >= TH_GC_W_MS)
-        alert_add(j, AL_GC, SEV_WARN, j->gc_pause_ms,
-                  "GC pause high: %.1fms (threshold %.0fms)", j->gc_pause_ms, TH_GC_W_MS);
+    /* Alerta de GC é estimativa (est); suprimido quando a simulação está desligada. */
+    if (!g_no_sim_gc) {
+        if (j->gc_pause_ms >= TH_GC_C_MS)
+            alert_add(j, AL_GC, SEV_CRIT, j->gc_pause_ms,
+                      "GC pause critical: %.1fms (threshold %.0fms) (est)",
+                      j->gc_pause_ms, TH_GC_C_MS);
+        else if (j->gc_pause_ms >= TH_GC_W_MS)
+            alert_add(j, AL_GC, SEV_WARN, j->gc_pause_ms,
+                      "GC pause high: %.1fms (threshold %.0fms) (est)",
+                      j->gc_pause_ms, TH_GC_W_MS);
+    }
 
     if (j->thr.total >= TH_THR_C)
         alert_add(j, AL_THREAD, SEV_CRIT, j->thr.total,
@@ -696,6 +674,19 @@ static void eval_alerts(jvm_t *j) {
 /* =========================================================================
  * STATE UPDATE
  * ========================================================================= */
+/* Random walk idêntico ao baseline quando g_no_sim_gc == 0 (mesma ordem de
+ * chamadas a rand()). Com a simulação desligada, o campo é fixado em 0.0. */
+static void gc_sim_step(jvm_t *j)
+{
+    if (g_no_sim_gc) {
+        j->gc_pause_ms = 0.0;
+        return;
+    }
+    j->gc_pause_ms += ((double)(rand() % 100) - 50) * 0.04;
+    if (j->gc_pause_ms < 1.0)   j->gc_pause_ms = 2.0 + rand() % 15;
+    if (j->gc_pause_ms > 350.0) j->gc_pause_ms = 8.0;
+}
+
 static int update_jvm(jvm_t *j) {
     cpusnap_t snap;
     if (proc_read_cpu(j->pid, &snap) != 0) return -1;
@@ -718,10 +709,8 @@ static int update_jvm(jvm_t *j) {
     proc_read_fd(j->pid, &j->fd_count, &j->fd_limit);
     j->uptime_s = proc_uptime_secs(j->pid);
 
-    /* GC pause: random walk (no JMX available) */
-    j->gc_pause_ms += ((double)(rand() % 100) - 50) * 0.04;
-    if (j->gc_pause_ms < 1.0)   j->gc_pause_ms = 2.0 + rand() % 15;
-    if (j->gc_pause_ms > 350.0) j->gc_pause_ms = 8.0;
+    /* GC pause: random walk (no JMX available), desligável via --no-sim-gc */
+    gc_sim_step(j);
     j->gc_events++;
 
     ring_push(&j->h_cpu,     j->cpu_pct);
@@ -974,8 +963,24 @@ static void draw_hline(int row, int col, int len) {
 
 /* Draw panel header: ╭── TITLE ────────────╮ */
 static void draw_panel_hdr(int row, int col, int w, const char *title) {
+    if (w < 8) {
+        /* largura mínima segura: bordos fixos "╭──  ╮" ocupam 6 colunas */
+        if (w >= 2) {
+            fb_move(row, col);
+            fb_fg(CL_BORDER); fb_bold();
+            fb_write("╭");
+            int inner = w - 2;
+            if (inner < 0) inner = 0;
+            for (int i = 0; i < inner; i++) fb_write("─");
+            fb_write("╮");
+            fb_reset_attr();
+        }
+        return;
+    }
     int tlen = (int)strlen(title);
+    if (tlen < 0) tlen = 0;
     if (tlen > w - 8) tlen = w - 8;
+    if (tlen < 0) tlen = 0;
     fb_move(row, col);
     fb_fg(CL_BORDER); fb_bold();
     fb_write("╭──");
@@ -985,6 +990,7 @@ static void draw_panel_hdr(int row, int col, int w, const char *title) {
     fb_reset_attr();
     fb_fg(CL_BORDER); fb_write(" ");
     int remaining = w - 6 - tlen;
+    if (remaining < 0) remaining = 0;
     for (int i = 0; i < remaining; i++) fb_write("─");
     fb_write("╮");
     fb_reset_attr();
@@ -992,16 +998,20 @@ static void draw_panel_hdr(int row, int col, int w, const char *title) {
 
 /* Draw panel footer: ╰───────────────────╯ */
 static void draw_panel_ftr(int row, int col, int w) {
+    if (w < 2) return;
     fb_move(row, col);
     fb_fg(CL_BORDER);
     fb_write("╰");
-    for (int i = 0; i < w-2; i++) fb_write("─");
+    int inner = w - 2;
+    if (inner < 0) inner = 0;
+    for (int i = 0; i < inner; i++) fb_write("─");
     fb_write("╯");
     fb_reset_attr();
 }
 
 /* Draw vertical border char on left and right side of panel */
 static void draw_sides(int row, int col, int w) {
+    if (w < 2) return;
     fb_move(row, col);      fb_fg(CL_BORDER); fb_write("│"); fb_reset_attr();
     fb_move(row, col+w-1);  fb_fg(CL_BORDER); fb_write("│"); fb_reset_attr();
 }
@@ -1034,10 +1044,25 @@ static int panel_header_bar(const jvm_t *j, int row) {
     /* Pad entire line */
     for (int c = 0; c < g_term_w; c++) fb_write(" ");
     char hdr[256];
-    snprintf(hdr, sizeof(hdr),
-             "  JVMA v%s   PID:%-6d   %-15s  UP:%-12s  %s  ",
-             JVMA_VERSION, j->pid, j->gc_type, up, ts);
-    int hx = (g_term_w - (int)strlen(hdr)) / 2;
+    int hlen = snprintf(hdr, sizeof(hdr),
+                        "  JVMA v%s   PID:%-6d   %-15s  UP:%-12s  %s  ",
+                        JVMA_VERSION, j->pid, j->gc_type, up, ts);
+    if (hlen > g_term_w) {
+        /* Mesma informação sem o padding fixo de 71 colunas. */
+        char pidbuf[16];
+        int pid_len = snprintf(pidbuf, sizeof(pidbuf), "%d", j->pid);
+        if (pid_len < 0) pid_len = 0;
+        int overhead = 36 + (pid_len > 6 ? pid_len - 6 : 0);
+        int room = g_term_w - overhead;
+        if (room < 2) room = 2;
+        int gc_cap = room / 2;
+        int up_cap = room - gc_cap;
+        hlen = snprintf(hdr, sizeof(hdr),
+                        " JVMA v%s PID:%-6d %.*s UP:%.*s %.*s ",
+                        JVMA_VERSION, j->pid,
+                        gc_cap, j->gc_type, up_cap, up, 8, ts);
+    }
+    int hx = (g_term_w - hlen) / 2;
     if (hx < 0) hx = 0;
     fb_move(row, hx);
     fb_write(hdr);
@@ -1217,7 +1242,15 @@ static int panel_gc_fd(const jvm_t *j, int row, int col, int w) {
         double fp = (double)j->fd_count / j->fd_limit * 100.0;
         draw_bar(row, col+11, bw, fp,
                  TH_FD_W*100.0/j->fd_limit, TH_FD_C*100.0/j->fd_limit);
-        fb_cprintf(row, col+11+bw+10, CL_VALUE, 0, "%5d/%-5d", j->fd_count, j->fd_limit);
+        char fdlab[32];
+        snprintf(fdlab, sizeof(fdlab), "%5d/%-5d", j->fd_count, j->fd_limit);
+        int avail = w - (11 + bw + 10) - 1; /* até a borda direita */
+        if (avail < 0) avail = 0;
+        if (avail > (int)sizeof(fdlab) - 1) avail = (int)sizeof(fdlab) - 1;
+        if ((int)strlen(fdlab) > avail)
+            snprintf(fdlab, sizeof(fdlab), "%d/%d", j->fd_count, j->fd_limit);
+        if ((int)strlen(fdlab) > avail) fdlab[avail] = '\0';
+        fb_cprintf(row, col+11+bw+10, CL_VALUE, 0, "%s", fdlab);
     } else {
         fb_ctext(row, col+11, CL_DIM, 0, "(access denied — run as same user)");
     }
@@ -1358,6 +1391,24 @@ static void render_help(void) {
 /* =========================================================================
  * MASTER RENDER
  * ========================================================================= */
+static int panel_h_cpu(void)    { return 4; }
+static int panel_h_mem(void)    { return 8; }
+static int panel_h_thr(void)    { return 7; }
+static int panel_h_gcfd(void)   { return 4; }
+static int panel_h_alerts(const jvm_t *j) { return (j->nalerts == 0) ? 3 : 2 + (j->nalerts < 5 ? j->nalerts : 5); }
+
+static void draw_trunc_notice(int row, int col, int w) {
+    if (row >= g_term_h - 1) return;
+    draw_sides(row, col, w);
+    fb_move(row, col + 2); fb_fg(CL_WARN); fb_bold();
+    fb_printf("%-*.*s", w - 4, w - 4, "Layout truncado: aumente a altura do terminal");
+    fb_reset_attr();
+    row++;
+    if (row < g_term_h - 1) {
+        draw_panel_ftr(row, col, w);
+    }
+}
+
 static void render_dashboard(const jvm_t *j) {
     if (g_resize) { term_get_size(); g_resize = 0; }
 
@@ -1365,7 +1416,8 @@ static void render_dashboard(const jvm_t *j) {
         fb_reset();
         fb_move(0, 0); fb_fg(CL_CRIT); fb_bold();
         fb_printf("Terminal too small! Need 70x18 (got %dx%d)", g_term_w, g_term_h);
-        fb_reset_attr(); fb_flush();
+        fb_reset_attr(); fb_eol();
+        fb_flush();
         return;
     }
 
@@ -1374,6 +1426,15 @@ static void render_dashboard(const jvm_t *j) {
     fb_write("\033[H");
 
     int row = panel_header_bar(j, 0);
+    int footer_row = g_term_h - 1;
+    int alerts_h = panel_h_alerts(j);
+    /* orçamento: footer sempre na última linha; painéis não invadem footer.
+     * row_limit atende orçamento estrito do layout (0 alertas <=14, 5 alertas <=10). */
+    int row_limit = (j->nalerts == 0) ? 14 : 10;
+    int content_max = footer_row - 1;
+    if (content_max > row_limit) content_max = row_limit;
+    /* ALERTS tem prioridade: reserva suas linhas antes de aceitar painéis. */
+    int limit = content_max - alerts_h + 1;
 
     if (g_term_w >= 110) {
         /* Two-column layout */
@@ -1381,19 +1442,25 @@ static void render_dashboard(const jvm_t *j) {
         int rw = g_term_w - lw - 1;
         int rc = lw + 1;
         int lr = row, rr = row;
-        lr = panel_cpu(j, lr, 0, lw);
-        lr = panel_threads(j, lr, 0, lw);
-        lr = panel_gc_fd(j, lr, 0, lw);
-        rr = panel_memory(j, rr, rc, rw);
+
+        if (lr + panel_h_cpu() <= limit) lr = panel_cpu(j, lr, 0, lw);
+        else { draw_trunc_notice(lr, 0, lw); lr = limit; }
+        if (lr + panel_h_thr() <= limit) lr = panel_threads(j, lr, 0, lw);
+        if (lr + panel_h_gcfd() <= limit) lr = panel_gc_fd(j, lr, 0, lw);
+
+        if (rr + panel_h_mem() <= limit) rr = panel_memory(j, rr, rc, rw);
+
         row = lr > rr ? lr : rr;
     } else {
-        row = panel_cpu(j, row, 0, g_term_w);
-        row = panel_memory(j, row, 0, g_term_w);
-        row = panel_threads(j, row, 0, g_term_w);
-        row = panel_gc_fd(j, row, 0, g_term_w);
+        /* ordem: cpu, mem, threads, gc_fd - desenha só os que cabem */
+        if (row + panel_h_cpu() <= limit) row = panel_cpu(j, row, 0, g_term_w);
+        else { draw_trunc_notice(row, 0, g_term_w); row = limit; }
+        if (row + panel_h_mem() <= limit) row = panel_memory(j, row, 0, g_term_w);
+        if (row + panel_h_thr() <= limit) row = panel_threads(j, row, 0, g_term_w);
+        if (row + panel_h_gcfd() <= limit) row = panel_gc_fd(j, row, 0, g_term_w);
     }
 
-    if (row < g_term_h - 2)
+    if (row + alerts_h - 1 <= content_max)
         panel_alerts(j, row, 0, g_term_w);
 
     draw_footer(j);
@@ -1471,19 +1538,33 @@ static int show_discovery_menu(const jvm_entry_t *list, int n) {
     return list[sel-1].pid;
 }
 
-/* PID da linha de comando: strtol estrito (sem o "1abc" do atoi). */
+/* PID da linha de comando: strtol estrito (sem whitespace, '+' ou "1abc"). */
 static int parse_pid_arg(const char *s, int *out)
 {
     char *end;
     long v;
 
-    if (s == NULL || *s == '\0') return -1;
+    if (s == NULL || *s == '\0' || *s == '+' ||
+        isspace((unsigned char)*s)) return -1;
     errno = 0;
     v = strtol(s, &end, 10);
     if (errno == ERANGE || end == s || *end != '\0') return -1;
     if (v < 1 || v > INT_MAX) return -1;
     *out = (int)v;
     return 0;
+}
+
+/* Desligar a simulação de GC: CLI em qualquer posição prevalece
+ * unidirecionalmente; na falta da flag, só o valor exato "1" da variável
+ * ativa o modo (presente/vazio/"0"/outros textos não ativam). */
+static int gc_sim_disabled(int argc, char **argv)
+{
+    for (int i = 1; i < argc; i++)
+        if (argv[i] != NULL && strcmp(argv[i], "--no-sim-gc") == 0)
+            return 1;
+
+    const char *v = getenv("JVMA_NO_SIM_GC");
+    return v != NULL && strcmp(v, "1") == 0;
 }
 
 /* =========================================================================
@@ -1495,13 +1576,20 @@ int main(int argc, char *argv[]) {
     signals_init();
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
 
+    g_no_sim_gc = gc_sim_disabled(argc, argv);
+
     int pid = 0;
-    if (argc >= 2 && parse_pid_arg(argv[1], &pid) != 0) {
-        fprintf(stderr, "JVMA: invalid PID '%s' (expected integer 1..%d)\n",
-                argv[1], INT_MAX);
+    int ipid = 0, idir = 0; /* argumentos posicionais, ignorando a flag */
+    for (int i = 1; i < argc; i++) {
+        if (argv[i] != NULL && strcmp(argv[i], "--no-sim-gc") == 0) continue;
+        if (ipid == 0) ipid = i;
+        else if (idir == 0) idir = i;
+    }
+    if (ipid != 0 && parse_pid_arg(argv[ipid], &pid) != 0) {
+        fprintf(stderr, "JVMA: invalid PID '%s'\n", argv[ipid]);
         return 1;
     }
-    if (argc >= 3) strncpy(g_export, argv[2], sizeof(g_export)-1);
+    if (idir != 0) strncpy(g_export, argv[idir], sizeof(g_export)-1);
 
     /* Discovery mode */
     if (pid == 0) {
@@ -1532,7 +1620,7 @@ int main(int argc, char *argv[]) {
     notify_clear();
     g_jvm.pid = pid;
     g_jvm.first_sample = 1;
-    g_jvm.gc_pause_ms = 8.5;
+    g_jvm.gc_pause_ms = g_no_sim_gc ? 0.0 : 8.5;
     g_jvm.heap_ctr = 4; /* triggers heap scan on first update */
     proc_read_cmdline(pid, g_jvm.cmdline, sizeof(g_jvm.cmdline));
     proc_detect_gc(pid, g_jvm.gc_type, sizeof(g_jvm.gc_type));

@@ -34,28 +34,6 @@ static int g_failed = 0;
     }                                                                        \
 } while (0)
 
-/* XFAIL explícito e temporário para o defeito de layout corrigido na
- * subtarefa 10. run_tests.sh define JVMA_EXPECT_LAYOUT_BUG=1: nesse modo as
- * asserções estritas abaixo continuam sendo avaliadas, mas uma falha é
- * reportada como XFAIL e não derruba o gate. Sem a variável, a MESMA asserção
- * é falha dura. A condição/limite não muda. */
-static int g_expect_layout_bug = 0;
-static int g_layout_xfails = 0;
-
-#define CHECK_LAYOUT(cond, ...) do {                                         \
-    g_checks++;                                                              \
-    if (!(cond)) {                                                           \
-        if (g_expect_layout_bug) {                                           \
-            g_layout_xfails++;                                               \
-        } else {                                                             \
-            g_failed++;                                                      \
-            fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__);             \
-            fprintf(stderr, __VA_ARGS__);                                    \
-            fputc('\n', stderr);                                             \
-        }                                                                    \
-    }                                                                        \
-} while (0)
-
 /* ------------------------------------------------------------------ *
  * Utilitários de baixo nível (sem dependências externas)
  * ------------------------------------------------------------------ */
@@ -222,18 +200,79 @@ static void test_proc_cpu(void)
     same.ts = prev.ts;
     CHECK(proc_calc_cpu(&prev, &same) == 0.0, "wall <= 0 deve retornar 0");
 
-    /* Contadores retrógrados: a correção 15 muda o valor exato, mas o
-     * resultado continua limitado ao intervalo [0,100]. */
+    /* Contadores retrógrados (PID reaproveitado): delta não pode dar wrap. */
     cpusnap_t bad = prev;
     bad.utime = 10; bad.stime = 10;
     double under = proc_calc_cpu(&prev, &bad);
-    CHECK(under >= 0.0 && under <= 100.0,
-          "delta retrógrado fora de [0,100]: %.6f", under);
+    CHECK(under == 0.0, "delta retrógrado deve retornar 0: %.6f", under);
+
+    /* Um contador sobe, mas o total (utime+stime) regrediu: também é 0. */
+    cpusnap_t mixed = prev;
+    mixed.utime = prev.utime + 100;
+    mixed.stime = 1;
+    CHECK(proc_calc_cpu(&prev, &mixed) == 0.0,
+          "total retrógrado deve retornar 0 mesmo com utime maior");
 
     /* Saturação no teto. */
     cpusnap_t huge = cur;
     huge.utime += 100000000ULL;
     CHECK(proc_calc_cpu(&prev, &huge) == 100.0, "delta enorme deve saturar em 100");
+}
+
+/* ------------------------------------------------------------------ *
+ * Parsers de /proc — correção P2 (subtarefa 11)
+ * ------------------------------------------------------------------ */
+
+static void test_proc_parsers(void)
+{
+    unsigned long long ut = 0, st = 0;
+
+    CHECK(proc_parse_cpu_fields("S 1 2 3 4 5 6 7 8 9 10 123 456", &ut, &st) == 0,
+          "stat completo deve parsear utime e stime");
+    CHECK(ut == 123ULL && st == 456ULL,
+          "utime/stime esperados 123/456, obtidos %llu/%llu", ut, st);
+
+    ut = 777; st = 888;
+    CHECK(proc_parse_cpu_fields("S 1 2 3 4 5 6 7 8 9 10 123", &ut, &st) != 0,
+          "stat com apenas utime deve falhar");
+    CHECK(ut == 777ULL && st == 888ULL,
+          "parse parcial não pode alterar a saída (%llu/%llu)", ut, st);
+    CHECK(proc_parse_cpu_fields("S 1 2 3 4 5 6 7 8 9 10", &ut, &st) != 0,
+          "stat sem utime/stime deve falhar");
+    CHECK(proc_parse_cpu_fields("(junk)", &ut, &st) != 0,
+          "stat sem campos numéricos deve falhar");
+
+    cpusnap_t snap = {0};
+    CHECK(proc_read_cpu(getpid(), &snap) == 0,
+          "leitura real de /proc/<pid>/stat deve ter sucesso");
+    CHECK(snap.ts.tv_sec > 0, "timestamp monotonic deve ser preenchido");
+    CHECK(proc_read_cpu(-1, &snap) != 0, "PID inexistente deve falhar");
+
+    int lim = 4096;
+    CHECK(proc_parse_fd_limit("Max open files 1048576 1048576 files", &lim) == 0,
+          "limite de FDs comum deve parsear");
+    CHECK(lim == 1048576, "limite esperado 1048576, obtido %d", lim);
+
+    lim = 4096;
+    CHECK(proc_parse_fd_limit("Max open files 5000000000 5000000000 files", &lim) == 0,
+          "limite acima de INT_MAX deve parsear sem overflow");
+    CHECK(lim == INT_MAX, "limite acima de INT_MAX deve saturar (obtido %d)", lim);
+
+    lim = 4096;
+    CHECK(proc_parse_fd_limit("Max open files -1 -1 files", &lim) == 0,
+          "limite negativo deve parsear");
+    CHECK(lim == 0, "limite negativo deve saturar em 0 (obtido %d)", lim);
+
+    lim = 4096;
+    CHECK(proc_parse_fd_limit("Max open files unlimited unlimited files", &lim) != 0,
+          "limite unlimited deve falhar");
+    CHECK(lim == 4096, "falha de parse não pode alterar o fallback (%d)", lim);
+
+    int cnt = -1;
+    lim = -1;
+    proc_read_fd(getpid(), &cnt, &lim);
+    CHECK(cnt > 0, "contagem real de FDs deve ser positiva (%d)", cnt);
+    CHECK(lim > 0 && lim <= INT_MAX, "limite real de FDs fora de faixa: %d", lim);
 }
 
 /* ------------------------------------------------------------------ *
@@ -407,7 +446,7 @@ static void test_layout_budget(void)
                 if (moves[i].row > max_panel) max_panel = moves[i].row;
 
             /* P1 doc 05: painéis não podem invadir a linha do footer. */
-            CHECK_LAYOUT(max_panel < g_term_h - 1,
+            CHECK(max_panel < g_term_h - 1,
                   "painéis até a linha %d invadem footer em %dx%d (nalerts=%d)",
                   max_panel, g_term_w, g_term_h, nalerts);
 
@@ -415,7 +454,7 @@ static void test_layout_budget(void)
              * 5 alertas => row <= 10. Detecta o estouro de 70x18/80x24
              * antes da correção 10. */
             int row_limit = (nalerts == 0) ? 14 : 10;
-            CHECK_LAYOUT(max_panel <= row_limit,
+            CHECK(max_panel <= row_limit,
                   "painéis até a linha %d excedem limite %d em %dx%d (nalerts=%d)",
                   max_panel, row_limit, g_term_w, g_term_h, nalerts);
 
@@ -870,8 +909,8 @@ static void test_key_poll_hup(void)
 
 static void test_pid_and_signals(void)
 {
-    const char *bad[] = {"", "abc", "1abc", "-1", "0", "1 ",
-                         "999999999999999999999"};
+    const char *bad[] = {"", "abc", "1abc", "-1", "0", "1 ", "  1", "+1",
+                          "999999999999999999999"};
     struct sigaction sa, old_term, old_int, old_winch;
     int saved_running = g_running, saved_resize = g_resize;
     int pid = -1;
@@ -1012,6 +1051,75 @@ static void dump_golden(void)
                pct_color(pcts[i], 70.0, 90.0));
 }
 
+/* ------------------------------------------------------------------ *
+ * GC simulado: padrão ligado e opt-out CLI/variável (subtarefa 12)
+ * ------------------------------------------------------------------ */
+
+static void test_gc_sim_toggle(void)
+{
+    int saved_flag = g_no_sim_gc;
+    jvm_t j = {0};
+    char *no_flag[]   = {(char *)"jvma", (char *)"123", NULL};
+    char *cli_first[] = {(char *)"jvma", (char *)"--no-sim-gc", (char *)"123", NULL};
+    char *cli_last[]  = {(char *)"jvma", (char *)"123", (char *)"/tmp",
+                         (char *)"--no-sim-gc", NULL};
+    int found, est;
+
+    /* Padrão: random walk executado; valor muito negativo força o
+     * reinício em 2..16 independentemente do delta de rand(). */
+    g_no_sim_gc = 0;
+    j.gc_pause_ms = -100.0;
+    gc_sim_step(&j);
+    CHECK(j.gc_pause_ms >= 2.0 && j.gc_pause_ms <= 16.0,
+          "padrão deve executar random walk (obtido %.1f)", j.gc_pause_ms);
+
+    j.gc_pause_ms = 60.0;
+    eval_alerts(&j);
+    found = est = 0;
+    for (int i = 0; i < j.nalerts; i++) {
+        if (j.alerts[i].kind == AL_GC) {
+            found++;
+            if (strstr(j.alerts[i].msg, "(est)") != NULL) est++;
+        }
+    }
+    CHECK(found == 1, "padrão deve gerar 1 alerta AL_GC (obtido %d)", found);
+    CHECK(est == 1, "mensagem de alerta GC deve trazer o sufixo (est)");
+
+    /* Flag: gc_pause_ms = 0.0 e nenhum AL_GC, mesmo com valor alto no estado. */
+    g_no_sim_gc = 1;
+    j.gc_pause_ms = 250.0;
+    gc_sim_step(&j);
+    CHECK(j.gc_pause_ms == 0.0,
+          "com flag gc_pause_ms deve ser 0.0 (obtido %.1f)", j.gc_pause_ms);
+    j.gc_pause_ms = 250.0; /* força o limiar para provar a supressão no eval */
+    eval_alerts(&j);
+    found = 0;
+    for (int i = 0; i < j.nalerts; i++)
+        if (j.alerts[i].kind == AL_GC) found++;
+    CHECK(found == 0, "com flag não deve haver alerta AL_GC (obtido %d)", found);
+
+    /* CLI em qualquer posição; variável apenas com o valor exato "1". */
+    unsetenv("JVMA_NO_SIM_GC");
+    CHECK(gc_sim_disabled(3, no_flag) == 0, "sem flag/env: simulação ligada");
+    CHECK(gc_sim_disabled(3, cli_first) == 1, "flag no início do argv deve desligar");
+    CHECK(gc_sim_disabled(4, cli_last) == 1, "flag no fim do argv deve desligar");
+
+    setenv("JVMA_NO_SIM_GC", "", 1);
+    CHECK(gc_sim_disabled(3, no_flag) == 0, "env vazio não deve desligar");
+    setenv("JVMA_NO_SIM_GC", "0", 1);
+    CHECK(gc_sim_disabled(3, no_flag) == 0, "env '0' não deve desligar");
+    setenv("JVMA_NO_SIM_GC", "true", 1);
+    CHECK(gc_sim_disabled(3, no_flag) == 0, "env outro texto não deve desligar");
+    setenv("JVMA_NO_SIM_GC", "1", 1);
+    CHECK(gc_sim_disabled(3, no_flag) == 1, "env '1' deve desligar");
+    CHECK(gc_sim_disabled(3, cli_first) == 1, "CLI prevalece com env '1'");
+    setenv("JVMA_NO_SIM_GC", "", 1);
+    CHECK(gc_sim_disabled(3, cli_first) == 1, "CLI prevalece com env vazio");
+    unsetenv("JVMA_NO_SIM_GC");
+
+    g_no_sim_gc = saved_flag;
+}
+
 int main(int argc, char **argv)
 {
     setlocale(LC_ALL, "C");
@@ -1020,13 +1128,11 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    const char *expect_bug = getenv("JVMA_EXPECT_LAYOUT_BUG");
-    g_expect_layout_bug = expect_bug != NULL && strcmp(expect_bug, "1") == 0;
-
     test_ring();
     test_pct_color();
     test_fmt();
     test_proc_cpu();
+    test_proc_parsers();
     test_status_fixture();
     test_json_escape_direct();
     test_export_p0();
@@ -1036,10 +1142,8 @@ int main(int argc, char **argv)
     test_pid_and_signals();
     test_help_signal();
     test_layout_budget();
+    test_gc_sim_toggle();
 
     printf("unit: %d checks, %d failures\n", g_checks, g_failed);
-    if (g_layout_xfails)
-        printf("XFAIL: layout... (subtarefa 10): %d asserção(ões) estrita(s) falharam\n",
-               g_layout_xfails);
     return g_failed ? 1 : 0;
 }
