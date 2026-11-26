@@ -428,6 +428,15 @@ static void test_proc_root_long(void)
     CHECK(lim == 1048576,
           "limite de FDs via fixture/limites longo: %d (esperado 1048576)", lim);
 
+    char cmd_path[512], cmd[64];
+    proc_path(4242, "cmdline", cmd_path, sizeof(cmd_path));
+    FILE *cf = fopen(cmd_path, "w");
+    if (cf) { fwrite("java\0\033[2J\0-jar", 1, 14, cf); fclose(cf); }
+    proc_read_cmdline(4242, cmd, sizeof(cmd));
+    CHECK(strchr(cmd, 27) == NULL && strstr(cmd, "?[2J") != NULL,
+          "cmdline deve neutralizar ESC: '%s'", cmd);
+    unlink(cmd_path);
+
 cleanup:
     proc_set_root("/proc");
     unlink(fd0_path);

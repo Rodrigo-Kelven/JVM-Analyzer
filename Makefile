@@ -3,7 +3,7 @@ CFLAGS   = -O2 -Wall -Wextra -Wno-unused-result -Wno-format-truncation
 LDFLAGS  =
 LDLIBS   = -lm
 TARGET   = jvma
-SRC      = $(wildcard src/*.c)
+SRC      = $(sort $(wildcard src/*.c))
 HDRS     = $(wildcard src/*.h)
 LIB_SRCS = $(filter-out src/main.c,$(SRC))
 TEST_SRC = tests/test_unit.c
@@ -28,8 +28,10 @@ $(TEST_BIN): $(TEST_SRC) $(SRC) $(HDRS)
 $(TEST_ASAN): $(TEST_SRC) $(SRC) $(HDRS)
 	$(CC) $(CFLAGS) $(SAN_FLAGS) -o $@ $(TEST_SRC) $(LIB_SRCS) $(LDFLAGS) $(LDLIBS)
 
+PREFIX ?= /usr/local
+
 install: all
-	install -m 755 $(TARGET) /usr/local/bin/jvma
+	install -D -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/jvma
 	@echo "Installed to /usr/local/bin/jvma"
 
 clean:

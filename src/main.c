@@ -89,7 +89,6 @@ int main(int argc, char *argv[]) {
         pid = show_discovery_menu(discovered, n);
         if (pid <= 0) { term_printf("  Cancelled.\n"); return 0; }
         term_printf("  Attaching to PID %d...\n", pid);
-        usleep(400000);
     }
 
     /* Validate process */

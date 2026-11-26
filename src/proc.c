@@ -244,7 +244,7 @@ void proc_read_cmdline(int pid, char *out, int maxlen) {
     if (!f) { snprintf(out, (size_t)maxlen, "java (pid %d)", pid); return; }
     int c, i = 0;
     while (i < maxlen-1 && (c = fgetc(f)) != EOF)
-        out[i++] = (c == '\0') ? ' ' : (char)c;
+        out[i++] = (c == '\0') ? ' ' : (c < 0x20 || c == 0x7f) ? '?' : (char)c;
     out[i] = '\0';
     while (i > 0 && out[i-1] == ' ') out[--i] = '\0';
     fclose(f);

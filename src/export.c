@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <locale.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -31,7 +32,19 @@ static void notify_via_cb(const char *fmt, ...)
 
 void ensure_export_dir(void) {
     struct stat st;
-    if (stat(g_export, &st) != 0) mkdir(g_export, 0755);
+    if (stat(g_export, &st) != 0 && mkdir(g_export, 0755) != 0 && errno != EEXIST)
+        fprintf(stderr, "JVMA: falha ao criar %s: %s\n", g_export, strerror(errno));
+}
+
+/* Abre sem seguir symlink no último componente (evita symlink plantado). */
+static FILE *open_nofollow(const char *path, int append)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC |
+                        (append ? O_APPEND : O_TRUNC), 0644);
+    if (fd < 0) return NULL;
+    FILE *f = fdopen(fd, append ? "a" : "w");
+    if (!f) close(fd);
+    return f;
 }
 
 static void export_report_io(const char *action, const char *path)
@@ -77,7 +90,7 @@ void export_json(const jvm_t *j) {
     time_t now = time(NULL);
     snprintf(path, sizeof(path), "%s/jvma_%d_%ld.json", g_export, j->pid, now);
     errno = 0;
-    FILE *f = fopen(path, "w");
+    FILE *f = open_nofollow(path, 0);
     if (!f) {
         export_report_io("abrir", path);
         return;                 /* TUI permanece intacta */
@@ -139,13 +152,14 @@ void export_csv(const jvm_t *j) {
     ensure_export_dir();
     char path[512];
     snprintf(path, sizeof(path), "%s/jvma_%d.csv", g_export, j->pid);
-    int write_hdr = (access(path, F_OK) != 0);
     errno = 0;
-    FILE *f = fopen(path, "a");
+    FILE *f = open_nofollow(path, 1);
     if (!f) {
         export_report_io("abrir", path);
         return;
     }
+    struct stat st;
+    int write_hdr = (fstat(fileno(f), &st) == 0 && st.st_size == 0);
 
     char saved_numeric[64];
     export_numeric_push(saved_numeric, sizeof(saved_numeric));
