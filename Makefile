@@ -32,9 +32,12 @@ PREFIX ?= /usr/local
 
 install: all
 	install -D -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/jvma
-	@echo "Installed to /usr/local/bin/jvma"
+	@echo "Installed to $(DESTDIR)$(PREFIX)/bin/jvma"
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/jvma
 
 clean:
 	rm -f $(TARGET) $(TEST_BIN) $(TEST_ASAN)
 
-.PHONY: all check asan install clean
+.PHONY: all check asan install uninstall clean
