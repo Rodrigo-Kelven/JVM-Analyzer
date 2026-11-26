@@ -1,0 +1,11 @@
+7f0000000000-7f0000400000 ---p 00000000 00:00 0
+Size:             262144 kB
+Rss:                    0 kB
+Pss:                    0 kB
+Anonymous:              0 kB
+7f0000400000-7f0000800000 rw-p 00000000 00:00 0
+Size:             262144 kB
+Rss:              131072 kB
+Pss:              131072 kB
+Anonymous:        131072 kB
+Pss_Dirty:        131072 kB

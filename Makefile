@@ -3,7 +3,9 @@ CFLAGS   = -O2 -Wall -Wextra -Wno-unused-result -Wno-format-truncation
 LDFLAGS  =
 LDLIBS   = -lm
 TARGET   = jvma
-SRC      = jvm_analyzer.c
+SRC      = $(wildcard src/*.c)
+HDRS     = $(wildcard src/*.h)
+LIB_SRCS = $(filter-out src/main.c,$(SRC))
 TEST_SRC = tests/test_unit.c
 TEST_BIN = tests/test_unit
 TEST_ASAN = tests/test_unit_asan
@@ -11,7 +13,7 @@ SAN_FLAGS = -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
 
 all: $(TARGET)
 
-$(TARGET): $(SRC)
+$(TARGET): $(SRC) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS) $(LDLIBS)
 
 check: $(TEST_BIN)
@@ -20,11 +22,11 @@ check: $(TEST_BIN)
 asan: $(TEST_ASAN)
 	LC_ALL=C ./tests/run_tests.sh $(TEST_ASAN)
 
-$(TEST_BIN): $(TEST_SRC) $(SRC)
-	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(LDFLAGS) $(LDLIBS)
+$(TEST_BIN): $(TEST_SRC) $(SRC) $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(LIB_SRCS) $(LDFLAGS) $(LDLIBS)
 
-$(TEST_ASAN): $(TEST_SRC) $(SRC)
-	$(CC) $(CFLAGS) $(SAN_FLAGS) -o $@ $(TEST_SRC) $(LDFLAGS) $(LDLIBS)
+$(TEST_ASAN): $(TEST_SRC) $(SRC) $(HDRS)
+	$(CC) $(CFLAGS) $(SAN_FLAGS) -o $@ $(TEST_SRC) $(LIB_SRCS) $(LDFLAGS) $(LDLIBS)
 
 install: all
 	install -m 755 $(TARGET) /usr/local/bin/jvma

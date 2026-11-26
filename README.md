@@ -107,6 +107,14 @@ Alertas são avaliados a cada ciclo e deduplicados. Severidades: `[WARN]` e `[CR
 | `-` / `_` | Aumentar intervalo (mais lento, máximo 10 s) |
 | `h` / `H` | Exibir/esconder overlay de ajuda |
 
+As teclas são lidas de `stdin` mesmo quando ele **não é um TTY** (pipe ou arquivo); o modo raw (sem eco) é aplicado apenas em TTY. Exemplo sem TTY:
+
+```bash
+printf 'ecq' | ./jvma <PID> <DIR>   # exporta JSON + CSV e sai com rc 0
+```
+
+Com `</dev/null` não há exportação nem consumo de CPU: o programa encerra limadamente ao receber `SIGTERM`.
+
 ---
 
 ### Exportação
@@ -132,7 +140,7 @@ Nenhuma dependência além da biblioteca matemática padrão:
 make
 
 # Ou diretamente com gcc
-gcc -O2 -o jvma jvm_analyzer.c -lm
+gcc -O2 -o jvma src/*.c -lm
 ```
 
 **Requisitos:**
@@ -320,12 +328,22 @@ Varre `/proc/*/exe` com `readlink()` buscando executáveis cujo `basename` seja 
 
 ```
 JVM-Analyzer/
-├── jvm_analyzer.c   — código-fonte completo (~1.300 linhas, C99)
-├── Makefile         — build com gcc, flags de otimização
-├── README.md        — esta documentação
-└── exports/         — criado automaticamente na primeira exportação
-    ├── jvma_<pid>_<ts>.json
-    └── jvma_<pid>.csv
+├── src/
+│   ├── main.c        — entrypoint, CLI, loop principal
+│   ├── export.c/h    — export JSON/CSV + callback de notificação
+│   ├── discovery.c/h — auto-descoberta e menu interativo
+│   ├── render.c/h    — dashboard TUI e painéis
+│   ├── term.c/h      — terminal raw, frame buffer, sinais, notificação
+│   ├── sample.c/h    — coleta de amostra /proc
+│   ├── proc.c/h      — leitores /proc
+│   ├── alerts.c/h    — regras de alerta
+│   ├── gc_sim.c/h    — simulação de pausa GC
+│   ├── ring.c/h      — ring buffer/sparkline
+│   ├── util.c/h      — helpers de formato/escape/PID
+│   └── jvma_types.h  — tipos e constantes compartilhados
+├── tests/            — testes unitários, ANSI golden e fixtures
+├── Makefile          — build automatizado (wildcard src/*.c)
+└── README.md         — esta documentação
 ```
 
 ---

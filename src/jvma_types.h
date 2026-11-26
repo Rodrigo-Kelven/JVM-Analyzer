@@ -39,9 +39,6 @@
 #define CL_HDR_FG   255   /* white              — header bar text       */
 #define CL_OK        46   /* green              — "all nominal"         */
 
-/* Sparkline characters */
-static const char *SPARK[] = {"▁","▂","▃","▄","▅","▆","▇","█"};
-
 /* =========================================================================
  * DATA STRUCTURES
  * ========================================================================= */

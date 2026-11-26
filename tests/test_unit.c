@@ -2,22 +2,36 @@
  * JVMA v6.0 — testes unitários (subtarefa 6 + correção P0 da subtarefa 7).
  *
  * A inclusão do fonte com `main` renomeado permite testar funções static
- * sem alterar jvm_analyzer.c. As verificações usam apenas contratos estáveis
+ * sem alterar contratos estáveis entre módulos. As verificações usam apenas contratos estáveis
  * (ring, helpers de formatação, proc_calc_cpu, export e posição do footer),
  * válidos antes e depois das correções 8-12 e das extrações 13-18.
  */
+#include <dirent.h>
+#include <fcntl.h>
+#include <math.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <math.h>
+#include <sys/stat.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
+#include "../src/ring.h"
+#include "../src/util.h"
+#include "../src/proc.h"
+#include "../src/alerts.h"
+#include "../src/gc_sim.h"
+#include "../src/sample.h"
+#include "../src/render.h"
+#include "../src/term.h"
+#include "../src/export.h"
+#include "../src/discovery.h"
 #define main jvma_main
-#include "../jvm_analyzer.c"
+#include "../src/main.c"
 #undef main
 #pragma GCC diagnostic pop
 
@@ -276,12 +290,11 @@ static void test_proc_parsers(void)
 }
 
 /* ------------------------------------------------------------------ *
- * Leitura real de /proc/self/status (subtarefa 6)
+ * Leitura de status via fixture (reservada na subtarefa 6)
  * ------------------------------------------------------------------ */
 
-/* O caminho ainda é fixo em proc_read_mem_status() (/proc/%d/status); a
- * injeção de caminho e o uso de tests/fixtures/proc_status.txt ficam para a
- * subtarefa 15. Aqui a função REAL é chamada com o PID deste processo. */
+/* A fixture reservada é agora injetada em proc_read_mem_status(); a função
+ * REAL continua sendo chamada com o PID deste processo. */
 
 /* /proc muda entre duas leituras (stdio e sscanf alocam páginas): 8 MB de
  * folga absorvem essa variação sem afetar a conferência dos valores. */
@@ -297,10 +310,9 @@ static void test_status_fixture(void)
     unsigned long rss = 0, vsz = 0, anon = 0, swap = 0, peak = 0;
 
     /* Oráculo independente: mesmo arquivo, sscanf separado da função sob
-     * teste. Feito antes da chamada real para minimizar a janela de variação
-     * dos contadores de /proc. */
-    FILE *f = fopen("/proc/self/status", "r");
-    CHECK(f != NULL, "/proc/self/status não pôde ser aberto");
+     * teste. */
+    FILE *f = fopen("tests/fixtures/proc_status.txt", "r");
+    CHECK(f != NULL, "fixture tests/fixtures/proc_status.txt não pôde ser aberto");
     if (f) {
         while (fgets(line, sizeof(line), f)) {
             unsigned long v;
@@ -313,6 +325,7 @@ static void test_status_fixture(void)
         fclose(f);
     }
 
+    proc_set_path("status", "tests/fixtures/proc_status.txt");
     mem_t mem = {0};
     int rc = proc_read_mem_status(getpid(), &mem);
     CHECK(rc == 0, "proc_read_mem_status(getpid) deve retornar 0, retornou %d", rc);
@@ -324,6 +337,107 @@ static void test_status_fixture(void)
     CHECK(near_kb(mem.anon_kb, anon), "anon_kb=%lu divergiu do sscanf=%lu", mem.anon_kb, anon);
     CHECK(near_kb(mem.swap_kb, swap), "swap_kb=%lu divergiu do sscanf=%lu", mem.swap_kb, swap);
     CHECK(near_kb(mem.peak_kb, peak), "peak_kb=%lu divergiu do sscanf=%lu", mem.peak_kb, peak);
+    proc_set_path("status", NULL);
+}
+
+/* ------------------------------------------------------------------ *
+ * Raiz longa + fixtures de stat/limits/smaps_rollup (subtarefa 15)
+ * ------------------------------------------------------------------ */
+
+static int copy_fixture(const char *src, const char *dst)
+{
+    FILE *in = fopen(src, "rb");
+    FILE *out;
+    char buf[1024];
+    size_t n;
+    int ok;
+
+    if (!in) return -1;
+    out = fopen(dst, "wb");
+    if (!out) { fclose(in); return -1; }
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { fclose(in); fclose(out); return -1; }
+    }
+    ok = !ferror(in);
+    fclose(in);
+    if (fclose(out) != 0) ok = 0;
+    return ok ? 0 : -1;
+}
+
+static void test_proc_root_long(void)
+{
+    char root[] = "/tmp/jvma-root.XXXXXX";
+    char pid_dir[512], fd_dir[512], fd0_path[512];
+    char stat_path[512], status_path[512], limits_path[512], rollup_path[512];
+    char out[512];
+    int fd0 = -1;
+    int ready;
+
+    if (mkdtemp(root) == NULL) {
+        CHECK(0, "mkdtemp falhou: %s", strerror(errno));
+        return;
+    }
+
+    snprintf(pid_dir, sizeof(pid_dir), "%s/4242", root);
+    snprintf(fd_dir, sizeof(fd_dir), "%s/fd", pid_dir);
+    snprintf(fd0_path, sizeof(fd0_path), "%s/0", fd_dir);
+    snprintf(stat_path, sizeof(stat_path), "%s/stat", pid_dir);
+    snprintf(status_path, sizeof(status_path), "%s/status", pid_dir);
+    snprintf(limits_path, sizeof(limits_path), "%s/limits", pid_dir);
+    snprintf(rollup_path, sizeof(rollup_path), "%s/smaps_rollup", pid_dir);
+
+    ready = (mkdir(pid_dir, 0700) == 0) && (mkdir(fd_dir, 0700) == 0);
+    fd0 = open(fd0_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (fd0 >= 0) close(fd0);
+    else          ready = 0;
+    ready = ready
+         && copy_fixture("tests/fixtures/proc_stat.txt", stat_path) == 0
+         && copy_fixture("tests/fixtures/proc_status.txt", status_path) == 0
+         && copy_fixture("tests/fixtures/proc_limits.txt", limits_path) == 0
+         && copy_fixture("tests/fixtures/proc_smaps_rollup.txt", rollup_path) == 0;
+    CHECK(ready, "falha ao preparar fixtures em %s", root);
+    if (!ready) goto cleanup;
+
+    proc_set_root(root);
+    proc_path(4242, "status", out, sizeof(out));
+    CHECK(strcmp(out, status_path) == 0,
+          "proc_set_root truncou raiz longa: '%s' (esperado '%s')", out, status_path);
+
+    cpusnap_t snap = {0};
+    CHECK(proc_read_cpu(4242, &snap) == 0,
+          "proc_read_cpu via raiz longa falhou");
+    CHECK(snap.utime == 5000ULL && snap.stime == 2500ULL,
+          "stat fixture via raiz longa: utime=%llu stime=%llu",
+          snap.utime, snap.stime);
+
+    mem_t mem = {0};
+    CHECK(proc_read_mem_status(4242, &mem) == 0,
+          "proc_read_mem_status via raiz longa falhou");
+    CHECK(mem.rss_kb == 524288UL && mem.vsz_kb == 786432UL,
+          "status fixture via raiz longa: rss=%lu vsz=%lu", mem.rss_kb, mem.vsz_kb);
+
+    memset(&mem, 0, sizeof(mem));
+    proc_read_smaps_rollup(4242, &mem);
+    CHECK(mem.pss_kb == 131072UL && mem.anon_kb == 131072UL,
+          "smaps_rollup fixture via raiz longa: pss=%lu anon=%lu",
+          mem.pss_kb, mem.anon_kb);
+
+    int cnt = -1, lim = -1;
+    proc_read_fd(4242, &cnt, &lim);
+    CHECK(cnt >= 1, "contagem de FDs via raiz longa deve ser positiva (%d)", cnt);
+    CHECK(lim == 1048576,
+          "limite de FDs via fixture/limites longo: %d (esperado 1048576)", lim);
+
+cleanup:
+    proc_set_root("/proc");
+    unlink(fd0_path);
+    unlink(stat_path);
+    unlink(status_path);
+    unlink(limits_path);
+    unlink(rollup_path);
+    rmdir(fd_dir);
+    rmdir(pid_dir);
+    rmdir(root);
 }
 
 /* ------------------------------------------------------------------ *
@@ -343,12 +457,13 @@ static int capture_dashboard(const jvm_t *j, char *buf, size_t cap)
     if (!tmp) return -1;
     int fd = fileno(tmp);
     int saved = dup(STDOUT_FILENO);
+    int itvl_ms = DEFAULT_ITVL_MS;
     if (fd < 0 || saved < 0) { fclose(tmp); if (saved >= 0) close(saved); return -1; }
 
     fflush(stdout);
     dup2(fd, STDOUT_FILENO);
     fb_reset();
-    render_dashboard(j);
+    render_dashboard(j, &itvl_ms);
     fflush(stdout);
     dup2(saved, STDOUT_FILENO);
     close(saved);
@@ -390,6 +505,87 @@ static int parse_moves(const char *s, move_t *moves, int cap)
     return n;
 }
 
+/* ------------------------------------------------------------------ *
+ * Capturas ANSI byte a byte (70x18/80x24/110x30/200x50)
+ * ------------------------------------------------------------------ */
+
+/* FNV-1a 64: hash de todos os bytes do frame normalizado. */
+static uint64_t fnv1a64(const char *s)
+{
+    uint64_t h = 14695981039346656037ULL;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h ^= (uint64_t)*p;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* O cabeçalho inclui localtime(): normaliza apenas HH:MM:SS. */
+static void normalize_timestamp(char *s)
+{
+    for (char *p = s; *p; p++) {
+        if (p[0] >= '0' && p[0] <= '9' && p[1] >= '0' && p[1] <= '9' &&
+            p[2] == ':' && p[3] >= '0' && p[3] <= '9' && p[4] >= '0' && p[4] <= '9' &&
+            p[5] == ':' && p[6] >= '0' && p[6] <= '9' && p[7] >= '0' && p[7] <= '9') {
+            memcpy(p, "00:00:00", 8);
+            p += 7;
+        }
+    }
+}
+
+/* Ordem: 0 alertas nos 4 tamanhos, depois 5 alertas nos mesmos 4 tamanhos. */
+static const uint64_t ANSI_GOLDEN[] = {
+    0x5c5fc1efb18f1521ULL, 0xec9eee01ef4f7484ULL,
+    0x944ac08c3ed9bb3cULL, 0x0e7d40bc91301271ULL,
+    0x6a52b3783a5a65bdULL, 0x3776f7bd837ec6e4ULL,
+    0xe27211113e5205e6ULL, 0x728997e76fbb1962ULL
+};
+
+static void make_dashboard_jvm(jvm_t *j, int nalerts)
+{
+    memset(j, 0, sizeof(*j));
+    j->pid = 1;
+    j->gc_pause_ms = 8.5;
+    j->fd_count = 10;
+    j->fd_limit = 1024;
+    j->thr.total = 20;
+    strcpy(j->gc_type, "G1");
+    strcpy(j->cmdline, "java -jar app.jar");
+    j->nalerts = nalerts;
+    for (int i = 0; i < nalerts && i < MAX_ALERTS; i++) {
+        j->alerts[i].sev = (i % 2 == 0) ? SEV_CRIT : SEV_WARN;
+        j->alerts[i].kind = (al_kind_t)(AL_CPU + i);
+        snprintf(j->alerts[i].msg, sizeof(j->alerts[i].msg),
+                 "Alerta %d: valor acima do limiar", i + 1);
+    }
+}
+
+static void test_ansi_golden(void)
+{
+    const int sizes[][2] = {{70,18}, {80,24}, {110,30}, {200,50}};
+    const int nalerts_cases[] = {0, 5};
+    char buf[65536];
+    unsigned idx = 0;
+
+    notify_clear();
+    for (unsigned ac = 0; ac < sizeof(nalerts_cases)/sizeof(nalerts_cases[0]); ac++) {
+        jvm_t j;
+        make_dashboard_jvm(&j, nalerts_cases[ac]);
+        for (unsigned s = 0; s < sizeof(sizes)/sizeof(sizes[0]); s++) {
+            term_test_set_size(sizes[s][0], sizes[s][1]);
+            term_test_set_resize(0);
+            int n = capture_dashboard(&j, buf, sizeof(buf));
+            normalize_timestamp(buf);
+            CHECK(n > 0 && fnv1a64(buf) == ANSI_GOLDEN[idx],
+                  "captura ANSI divergiu em %dx%d (nalerts=%d, bytes=%d, hash=%016llx)",
+                  sizes[s][0], sizes[s][1], nalerts_cases[ac], n,
+                  (unsigned long long)fnv1a64(buf));
+            idx++;
+        }
+    }
+    term_test_set_size(80, 24);
+}
+
 static void test_layout_budget(void)
 {
     /* 240x80 incluído como pior caso amplo; 70x18/80x24 exercitam o P1 do doc 05. */
@@ -419,26 +615,26 @@ static void test_layout_budget(void)
         }
 
         for (unsigned s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
-            g_term_w = sizes[s][0];
-            g_term_h = sizes[s][1];
-            g_resize = 0;
+            term_test_set_size(sizes[s][0], sizes[s][1]);
+            term_test_set_resize(0);
+            int w = term_width(), h = term_height();
 
             int len = capture_dashboard(&j, buf, sizeof(buf));
             int nm = parse_moves(buf, moves, 1024);
             CHECK(len > 0 && nm > 0,
-                  "render %dx%d (nalerts=%d) não produziu frame", g_term_w, g_term_h, nalerts);
+                  "render %dx%d (nalerts=%d) não produziu frame", w, h, nalerts);
 
-            int footer = g_term_h - 1;
+            int footer = h - 1;
             int footer_idx = -1;
             for (int i = 0; i < nm; i++)
                 if (moves[i].row == footer) footer_idx = i;
 
             CHECK(footer_idx >= 0,
                   "footer ausente na linha %d (%dx%d, nalerts=%d)",
-                  footer, g_term_w, g_term_h, nalerts);
+                  footer, w, h, nalerts);
             CHECK(nm > 0 && moves[nm - 1].row == footer,
                   "footer deve ser a última posição desenhada (%dx%d, nalerts=%d): última=%d",
-                  g_term_w, g_term_h, nalerts, nm > 0 ? moves[nm - 1].row : -1);
+                  w, h, nalerts, nm > 0 ? moves[nm - 1].row : -1);
 
             /* Painéis = todas as posições anteriores ao footer. */
             int max_panel = -1;
@@ -446,9 +642,9 @@ static void test_layout_budget(void)
                 if (moves[i].row > max_panel) max_panel = moves[i].row;
 
             /* P1 doc 05: painéis não podem invadir a linha do footer. */
-            CHECK(max_panel < g_term_h - 1,
+            CHECK(max_panel < h - 1,
                   "painéis até a linha %d invadem footer em %dx%d (nalerts=%d)",
-                  max_panel, g_term_w, g_term_h, nalerts);
+                  max_panel, w, h, nalerts);
 
             /* Cenários exigidos pelo revisor: 0 alertas => row <= 14;
              * 5 alertas => row <= 10. Detecta o estouro de 70x18/80x24
@@ -456,11 +652,11 @@ static void test_layout_budget(void)
             int row_limit = (nalerts == 0) ? 14 : 10;
             CHECK(max_panel <= row_limit,
                   "painéis até a linha %d excedem limite %d em %dx%d (nalerts=%d)",
-                  max_panel, row_limit, g_term_w, g_term_h, nalerts);
+                  max_panel, row_limit, w, h, nalerts);
 
             CHECK(strstr(buf, "JVMA v6.0") != NULL,
                   "cabeçalho ausente no render %dx%d (nalerts=%d)",
-                  g_term_w, g_term_h, nalerts);
+                  w, h, nalerts);
         }
     }
 }
@@ -747,41 +943,42 @@ static void test_export_p0(void)
 
 static void test_notification(void)
 {
-    char saved_msg[sizeof(g_notify_msg)];
-    time_t saved_at = g_notify_at;
-    time_t saved_until = g_notify_until;
-    int saved_w = g_term_w, saved_h = g_term_h, saved_resize = g_resize;
+    char saved_msg[512], msg[512];
+    time_t saved_at, saved_until, at, until;
+    int saved_w = term_width(), saved_h = term_height();
+    int saved_resize = term_test_resize();
+    int itvl_ms = DEFAULT_ITVL_MS;
     jvm_t j = {0};
     char buf[32768];
     time_t now;
 
-    snprintf(saved_msg, sizeof(saved_msg), "%s", g_notify_msg);
+    term_test_notify_state(saved_msg, sizeof(saved_msg), &saved_at, &saved_until);
     j.pid = 1;
     j.gc_pause_ms = 8.5;
     strcpy(j.gc_type, "G1");
     strcpy(j.cmdline, "java -jar app.jar");
 
-    g_term_w = 80;
-    g_term_h = 24;
-    g_resize = 0;
+    term_test_set_size(80, 24);
+    term_test_set_resize(0);
 
     notify_clear();
     now = time(NULL);
     CHECK(!notify_active(now), "notificação limpa não deve estar ativa");
-    CHECK(g_notify_msg[0] == '\0' && g_notify_at == 0 && g_notify_until == 0,
+    term_test_notify_state(msg, sizeof(msg), &at, &until);
+    CHECK(msg[0] == '\0' && at == 0 && until == 0,
           "notify_clear não zerou o estado da notificação");
 
     notify_set("JSON saved: %s", "/tmp/jvma-notify.json");
     now = time(NULL);
-    CHECK(strcmp(g_notify_msg, "JSON saved: /tmp/jvma-notify.json") == 0,
-          "mensagem de notificação divergiu: '%s'", g_notify_msg);
-    CHECK(g_notify_at <= now && g_notify_until == g_notify_at + NOTIFY_TTL_SEC,
-          "timestamp/TTL divergiram: at=%ld until=%ld",
-          (long)g_notify_at, (long)g_notify_until);
+    term_test_notify_state(msg, sizeof(msg), &at, &until);
+    CHECK(strcmp(notify_message(), "JSON saved: /tmp/jvma-notify.json") == 0,
+          "mensagem de notificação divergiu: '%s'", notify_message());
+    CHECK(at <= now && until == at + NOTIFY_TTL_SEC,
+          "timestamp/TTL divergiram: at=%ld until=%ld", (long)at, (long)until);
     CHECK(notify_active(now), "notificação deve estar ativa após notify_set");
-    CHECK(notify_active(g_notify_until - 1), "notificação deve estar ativa antes do TTL");
-    CHECK(!notify_active(g_notify_until), "notificação deve expirar no instante do TTL");
-    CHECK(!notify_active(g_notify_until + 1), "notificação deve expirar após o TTL");
+    CHECK(notify_active(until - 1), "notificação deve estar ativa antes do TTL");
+    CHECK(!notify_active(until), "notificação deve expirar no instante do TTL");
+    CHECK(!notify_active(until + 1), "notificação deve expirar após o TTL");
 
     CHECK(capture_dashboard(&j, buf, sizeof(buf)) > 0,
           "render com notificação ativa falhou");
@@ -790,34 +987,32 @@ static void test_notification(void)
     CHECK(strstr(buf, "\033[?25h") == NULL && strstr(buf, "\033[2J") == NULL,
           "notificação não deve restaurar/reiniciar o terminal");
 
-    int saved_running = g_running;
-    g_running = 1;
-    CHECK(handle_key(&j, 'q') == 0 && g_running == 0,
+    int saved_running = term_test_running();
+    term_test_set_running(1);
+    CHECK(handle_key(&j, &itvl_ms, 'q') == 0 && !term_test_running(),
           "q deve continuar saindo durante a notificação");
-    g_running = saved_running;
+    term_test_set_running(saved_running);
 
-    g_resize = 0;
-    sig_handler(SIGWINCH);
-    CHECK(g_resize == 1, "SIGWINCH deve continuar marcando resize durante a notificação");
-    g_resize = saved_resize;
+    term_test_set_resize(0);
+    term_test_signal(SIGWINCH);
+    CHECK(term_test_resize(), "SIGWINCH deve continuar marcando resize durante a notificação");
+    term_test_set_resize(saved_resize);
 
     notify_set("CSV appended: %s", "/tmp/jvma-notify.csv");
-    CHECK(strcmp(g_notify_msg, "CSV appended: /tmp/jvma-notify.csv") == 0 &&
+    CHECK(strcmp(notify_message(), "CSV appended: /tmp/jvma-notify.csv") == 0 &&
           notify_active(time(NULL)),
           "notify_set deve substituir a mensagem anterior");
 
-    g_notify_until = time(NULL) - 1;
+    term_test_notify_state(msg, sizeof(msg), &at, &until);
+    term_test_set_notify_state(msg, at, time(NULL) - 1);
     CHECK(capture_dashboard(&j, buf, sizeof(buf)) > 0,
           "render com notificação expirada falhou");
     CHECK(strstr(buf, "CSV appended:") == NULL,
           "notificação expirada ainda é desenhada no footer");
 
-    snprintf(g_notify_msg, sizeof(g_notify_msg), "%s", saved_msg);
-    g_notify_at = saved_at;
-    g_notify_until = saved_until;
-    g_term_w = saved_w;
-    g_term_h = saved_h;
-    g_resize = saved_resize;
+    term_test_set_notify_state(saved_msg, saved_at, saved_until);
+    term_test_set_size(saved_w, saved_h);
+    term_test_set_resize(saved_resize);
 }
 
 /* ------------------------------------------------------------------ *
@@ -827,8 +1022,8 @@ static void test_notification(void)
 static void test_input_timing(void)
 {
     struct timespec deadline, t0, t1;
-    int saved_keys = g_keys_enabled;
-    int saved_itvl = g_itvl_ms;
+    int saved_keys = term_test_keys_enabled();
+    int itvl_ms = DEFAULT_ITVL_MS;
     jvm_t j = {0};
     int calls = 0;
     long long elapsed_ms;
@@ -843,7 +1038,7 @@ static void test_input_timing(void)
 
     /* Sem TTY/EOF, uma única espera cobre o intervalo inteiro: não pode
      * girar CPU com centenas de chamadas a poll() no mesmo intervalo. */
-    g_keys_enabled = 0;
+    term_test_set_keys_enabled(0);
     interval_deadline(&deadline, 60);
     clock_gettime(CLOCK_MONOTONIC, &t0);
     while (deadline_remaining_ms(&deadline) > 0) {
@@ -859,24 +1054,23 @@ static void test_input_timing(void)
           "espera de 60ms durou %lldms", elapsed_ms);
 
     /* Controles de intervalo continuam nos limites 500..10000 ms. */
-    g_itvl_ms = 2000;
-    for (int i = 0; i < 10; i++) handle_key(&j, '+');
-    CHECK(g_itvl_ms == 500, "'+' deve limitar a 500ms (obtido %d)", g_itvl_ms);
-    for (int i = 0; i < 25; i++) handle_key(&j, '-');
-    CHECK(g_itvl_ms == 10000, "'-' deve limitar a 10000ms (obtido %d)", g_itvl_ms);
-    CHECK(handle_key(&j, 'p') == 1 && j.paused == 1 &&
-          handle_key(&j, 'P') == 1 && j.paused == 0,
+    itvl_ms = 2000;
+    for (int i = 0; i < 10; i++) handle_key(&j, &itvl_ms, '+');
+    CHECK(itvl_ms == 500, "'+' deve limitar a 500ms (obtido %d)", itvl_ms);
+    for (int i = 0; i < 25; i++) handle_key(&j, &itvl_ms, '-');
+    CHECK(itvl_ms == 10000, "'-' deve limitar a 10000ms (obtido %d)", itvl_ms);
+    CHECK(handle_key(&j, &itvl_ms, 'p') == 1 && j.paused == 1 &&
+          handle_key(&j, &itvl_ms, 'P') == 1 && j.paused == 0,
           "p/P deve alternar pausa");
 
-    g_keys_enabled = saved_keys;
-    g_itvl_ms = saved_itvl;
+    term_test_set_keys_enabled(saved_keys);
 }
 
 static void test_key_poll_hup(void)
 {
     int pipefd[2];
     int saved_in = dup(STDIN_FILENO);
-    int saved_keys = g_keys_enabled;
+    int saved_keys = term_test_keys_enabled();
 
     CHECK(saved_in >= 0, "dup(STDIN_FILENO) falhou");
     if (saved_in < 0) return;
@@ -885,13 +1079,13 @@ static void test_key_poll_hup(void)
         CHECK(0, "pipe() falhou");
     } else {
         dup2(pipefd[0], STDIN_FILENO);
-        g_keys_enabled = 1;
+        term_test_set_keys_enabled(1);
 
         CHECK(write(pipefd[1], "q", 1) == 1, "write no pipe falhou");
         CHECK(term_read_key(200) == 'q', "POLLIN deve devolver o byte lido");
 
         close(pipefd[1]);
-        CHECK(term_read_key(200) == -1 && !g_keys_enabled,
+        CHECK(term_read_key(200) == -1 && !term_test_keys_enabled(),
               "POLLHUP/EOF deve desativar a leitura de teclas");
         CHECK(term_read_key(20) == -1, "após HUP não deve haver nova leitura");
 
@@ -899,8 +1093,138 @@ static void test_key_poll_hup(void)
         dup2(saved_in, STDIN_FILENO);
     }
 
-    g_keys_enabled = saved_keys;
+    term_test_set_keys_enabled(saved_keys);
     close(saved_in);
+}
+
+/* ------------------------------------------------------------------ *
+ * stdin não-TTY: term_raw habilita leitura; pipe/arquivo entregam bytes
+ * mesmo com HUP/EOF, e o help retorna em EOF (subtarefa 18 + correção final)
+ * ------------------------------------------------------------------ */
+
+typedef void (*term_fn_t)(void);
+
+/* term_raw/term_restore desenham no terminal: isola o fd 1 para não poluir
+ * a saída dos testes nem alterar o modo de um TTY real. */
+static void term_quiet(term_fn_t fn)
+{
+    int saved_out = dup(STDOUT_FILENO);
+    int nullfd = open("/dev/null", O_WRONLY);
+
+    if (saved_out >= 0 && nullfd >= 0) {
+        fflush(stdout);
+        dup2(nullfd, STDOUT_FILENO);
+        fn();
+        fflush(stdout);
+        dup2(saved_out, STDOUT_FILENO);
+    } else {
+        fn();
+    }
+    if (nullfd >= 0) close(nullfd);
+    if (saved_out >= 0) close(saved_out);
+}
+
+static void test_key_non_tty_pipe(void)
+{
+    int pipefd[2] = {-1, -1};
+    int saved_in = dup(STDIN_FILENO);
+    int saved_keys = term_test_keys_enabled();
+    int ready = (saved_in >= 0 && pipe(pipefd) == 0);
+
+    CHECK(ready, "dup()/pipe() falharam no teste de stdin não-TTY");
+    if (!ready) goto done;
+
+    dup2(pipefd[0], STDIN_FILENO);
+    term_quiet(term_raw);
+    CHECK(term_test_keys_enabled(),
+          "term_raw deve habilitar teclas em stdin não-TTY");
+
+    CHECK(write(pipefd[1], "ecq", 3) == 3, "escrita de 'ecq' no pipe falhou");
+    CHECK(term_read_key(200) == 'e', "'e' via pipe não foi lido");
+    CHECK(term_read_key(200) == 'c', "'c' via pipe não foi lido");
+    CHECK(term_read_key(200) == 'q', "'q' via pipe não foi lido");
+
+    close(pipefd[1]);
+    pipefd[1] = -1;
+    CHECK(term_read_key(50) == -1 && !term_test_keys_enabled(),
+          "POLLHUP/EOF deve desativar a leitura após drenar o pipe");
+
+    term_quiet(term_restore);
+    dup2(saved_in, STDIN_FILENO);
+
+done:
+    if (pipefd[1] >= 0) close(pipefd[1]);
+    if (pipefd[0] >= 0) close(pipefd[0]);
+    if (saved_in >= 0) close(saved_in);
+    term_test_set_keys_enabled(saved_keys);
+}
+
+static void test_key_non_tty_file(void)
+{
+    char path[] = "/tmp/jvma-keys.XXXXXX";
+    int fd = mkstemp(path);
+    int saved_in = dup(STDIN_FILENO);
+    int saved_keys = term_test_keys_enabled();
+    int ready = (fd >= 0 && saved_in >= 0);
+
+    CHECK(ready, "mkstemp()/dup() falharam no teste de arquivo de teclas");
+    if (!ready) goto done;
+
+    CHECK(write(fd, "ecq", 3) == 3, "escrita de 'ecq' no arquivo falhou");
+    CHECK(lseek(fd, 0, SEEK_SET) == 0, "rewind do arquivo de teclas falhou");
+    dup2(fd, STDIN_FILENO);
+    term_quiet(term_raw);
+    CHECK(term_test_keys_enabled(),
+          "term_raw deve habilitar teclas em arquivo redirecionado");
+
+    CHECK(term_read_key(200) == 'e', "'e' via arquivo não foi lido");
+    CHECK(term_read_key(200) == 'c', "'c' via arquivo não foi lido");
+    CHECK(term_read_key(200) == 'q', "'q' via arquivo não foi lido");
+    CHECK(term_read_key(50) == -1 && !term_test_keys_enabled(),
+          "EOF em arquivo deve desativar a leitura de teclas");
+
+    term_quiet(term_restore);
+    dup2(saved_in, STDIN_FILENO);
+
+done:
+    if (ready) unlink(path);
+    if (fd >= 0) close(fd);
+    if (saved_in >= 0) close(saved_in);
+    term_test_set_keys_enabled(saved_keys);
+}
+
+static void test_key_blocking_eof(void)
+{
+    int pipefd[2] = {-1, -1};
+    int saved_in = dup(STDIN_FILENO);
+    int saved_running = term_test_running();
+    struct timespec t0, t1;
+    long long ms;
+    int ready = (saved_in >= 0 && pipe(pipefd) == 0);
+
+    CHECK(ready, "dup()/pipe() falharam no teste de EOF do help");
+    if (!ready) goto done;
+
+    dup2(pipefd[0], STDIN_FILENO);
+    close(pipefd[1]);
+    pipefd[1] = -1;
+
+    term_test_set_running(1);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    term_read_key_blocking();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    ms = ((long long)t1.tv_sec - t0.tv_sec) * 1000
+       + ((long long)t1.tv_nsec - t0.tv_nsec) / 1000000;
+
+    CHECK(ms < 200, "term_read_key_blocking levou %lldms para ver EOF", ms);
+    CHECK(term_test_running(), "EOF no help não deve alterar g_running");
+    dup2(saved_in, STDIN_FILENO);
+
+done:
+    if (pipefd[1] >= 0) close(pipefd[1]);
+    if (pipefd[0] >= 0) close(pipefd[0]);
+    if (saved_in >= 0) close(saved_in);
+    term_test_set_running(saved_running);
 }
 
 /* ------------------------------------------------------------------ *
@@ -912,7 +1236,7 @@ static void test_pid_and_signals(void)
     const char *bad[] = {"", "abc", "1abc", "-1", "0", "1 ", "  1", "+1",
                           "999999999999999999999"};
     struct sigaction sa, old_term, old_int, old_winch;
-    int saved_running = g_running, saved_resize = g_resize;
+    int saved_running = term_test_running(), saved_resize = term_test_resize();
     int pid = -1;
 
     CHECK(parse_pid_arg("1", &pid) == 0 && pid == 1,
@@ -929,20 +1253,20 @@ static void test_pid_and_signals(void)
     sigaction(SIGTERM, NULL, &old_term);
     sigaction(SIGINT, NULL, &old_int);
     sigaction(SIGWINCH, NULL, &old_winch);
-    g_running = 1;
-    g_resize = 0;
-    signals_init();
+    term_test_set_running(1);
+    term_test_set_resize(0);
+    term_signals_init();
     sigaction(SIGTERM, NULL, &sa);
     CHECK((sa.sa_flags & SA_RESTART) != 0,
           "SIGTERM deve ser instalado com SA_RESTART explícito");
 
-    CHECK(raise(SIGTERM) == 0 && g_running == 0,
+    CHECK(raise(SIGTERM) == 0 && !term_test_running(),
           "SIGTERM deve zerar g_running via sigaction");
-    CHECK(raise(SIGWINCH) == 0 && g_resize == 1 && g_running == 0,
+    CHECK(raise(SIGWINCH) == 0 && term_test_resize() && !term_test_running(),
           "SIGWINCH deve marcar resize sem alterar g_running");
 
-    g_running = saved_running;
-    g_resize = saved_resize;
+    term_test_set_running(saved_running);
+    term_test_set_resize(saved_resize);
     sigaction(SIGTERM, &old_term, NULL);
     sigaction(SIGINT, &old_int, NULL);
     sigaction(SIGWINCH, &old_winch, NULL);
@@ -952,7 +1276,7 @@ static void test_pid_and_signals(void)
 static void test_alrm_term(int s)
 {
     (void)s;
-    sig_handler(SIGTERM);
+    term_test_signal(SIGTERM);
 }
 
 static void test_help_signal(void)
@@ -961,11 +1285,11 @@ static void test_help_signal(void)
     struct itimerval timer;
     struct timespec t0, t1;
     int pfd[2], saved_in, saved_out, nullfd, timer_set, pipe_ok;
-    int saved_running = g_running;
+    int saved_running = term_test_running();
     long long ms;
 
     sigaction(SIGTERM, NULL, &old_term);
-    signals_init();
+    term_signals_init();
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = test_alrm_term;
     sigemptyset(&sa.sa_mask);
@@ -987,7 +1311,7 @@ static void test_help_signal(void)
 
     memset(&timer, 0, sizeof(timer));
     timer.it_value.tv_usec = 20000; /* sinal em 20 ms, sem tecla disponível */
-    g_running = 1;
+    term_test_set_running(1);
     timer_set = (setitimer(ITIMER_REAL, &timer, NULL) == 0);
     clock_gettime(CLOCK_MONOTONIC, &t0);
     if (timer_set) render_help();
@@ -998,7 +1322,7 @@ static void test_help_signal(void)
     memset(&timer, 0, sizeof(timer));
     setitimer(ITIMER_REAL, &timer, NULL);
     CHECK(timer_set, "setitimer() falhou no teste de interrupção do help");
-    CHECK(!g_running, "SIGTERM durante help deve encerrar g_running");
+    CHECK(!term_test_running(), "SIGTERM durante help deve encerrar g_running");
     CHECK(ms < 300, "render_help levou %lldms para reagir ao SIGTERM", ms);
 
     if (nullfd >= 0) close(nullfd);
@@ -1010,7 +1334,7 @@ help_restore_fd:
     close(saved_out);
     close(saved_in);
 help_done:
-    g_running = saved_running;
+    term_test_set_running(saved_running);
     sigaction(SIGALRM, &old_alrm, NULL);
     sigaction(SIGTERM, &old_term, NULL);
 }
@@ -1057,7 +1381,7 @@ static void dump_golden(void)
 
 static void test_gc_sim_toggle(void)
 {
-    int saved_flag = g_no_sim_gc;
+    int saved_flag = gc_sim_enabled() ? 0 : 1;
     jvm_t j = {0};
     char *no_flag[]   = {(char *)"jvma", (char *)"123", NULL};
     char *cli_first[] = {(char *)"jvma", (char *)"--no-sim-gc", (char *)"123", NULL};
@@ -1067,7 +1391,7 @@ static void test_gc_sim_toggle(void)
 
     /* Padrão: random walk executado; valor muito negativo força o
      * reinício em 2..16 independentemente do delta de rand(). */
-    g_no_sim_gc = 0;
+    gc_sim_set_disabled(0);
     j.gc_pause_ms = -100.0;
     gc_sim_step(&j);
     CHECK(j.gc_pause_ms >= 2.0 && j.gc_pause_ms <= 16.0,
@@ -1086,7 +1410,7 @@ static void test_gc_sim_toggle(void)
     CHECK(est == 1, "mensagem de alerta GC deve trazer o sufixo (est)");
 
     /* Flag: gc_pause_ms = 0.0 e nenhum AL_GC, mesmo com valor alto no estado. */
-    g_no_sim_gc = 1;
+    gc_sim_set_disabled(1);
     j.gc_pause_ms = 250.0;
     gc_sim_step(&j);
     CHECK(j.gc_pause_ms == 0.0,
@@ -1117,7 +1441,7 @@ static void test_gc_sim_toggle(void)
     CHECK(gc_sim_disabled(3, cli_first) == 1, "CLI prevalece com env vazio");
     unsetenv("JVMA_NO_SIM_GC");
 
-    g_no_sim_gc = saved_flag;
+    gc_sim_set_disabled(saved_flag);
 }
 
 int main(int argc, char **argv)
@@ -1127,6 +1451,11 @@ int main(int argc, char **argv)
         dump_golden();
         return 0;
     }
+    if (argc == 2 && strcmp(argv[1], "--ansi") == 0) {
+        test_ansi_golden();
+        printf("ansi: %d checks, %d failures\n", g_checks, g_failed);
+        return g_failed ? 1 : 0;
+    }
 
     test_ring();
     test_pct_color();
@@ -1134,13 +1463,18 @@ int main(int argc, char **argv)
     test_proc_cpu();
     test_proc_parsers();
     test_status_fixture();
+    test_proc_root_long();
     test_json_escape_direct();
     test_export_p0();
     test_notification();
     test_input_timing();
     test_key_poll_hup();
+    test_key_non_tty_pipe();
+    test_key_non_tty_file();
+    test_key_blocking_eof();
     test_pid_and_signals();
     test_help_signal();
+    test_ansi_golden();
     test_layout_budget();
     test_gc_sim_toggle();
 
