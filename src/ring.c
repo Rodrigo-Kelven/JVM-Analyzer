@@ -36,3 +36,19 @@ void ring_sparkline(const ring_t *r, char *out, int width) {
         strcat(out, SPARK[lv]);
     }
 }
+
+int ring_stats(const ring_t *r, int width, double *mn, double *mx,
+               double *first, double *last)
+{
+    int n = r->count < width ? r->count : width;
+    if (n <= 0) return 0;
+    *mn = 1e18; *mx = -1e18;
+    for (int i = 0; i < n; i++) {
+        double v = r->v[((r->head - 1 - i) + HISTORY_LEN*2) % HISTORY_LEN];
+        if (v < *mn) *mn = v;
+        if (v > *mx) *mx = v;
+        if (i == 0) *last = v;
+        if (i == n - 1) *first = v;
+    }
+    return n;
+}

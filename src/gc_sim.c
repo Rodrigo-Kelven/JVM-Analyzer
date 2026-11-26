@@ -23,6 +23,15 @@ void gc_sim_step(jvm_t *j)
     if (j->gc_pause_ms > 350.0) j->gc_pause_ms = 8.0;
 }
 
+int gc_sim_opt_in(int argc, char **argv)
+{
+    for (int i = 1; i < argc; i++)
+        if (argv[i] != NULL && strcmp(argv[i], "--sim-gc") == 0)
+            return 1;
+    const char *v = getenv("JVMA_SIM_GC");
+    return v != NULL && strcmp(v, "1") == 0;
+}
+
 /* Desligar a simulação de GC: CLI em qualquer posição prevalece
  * unidirecionalmente; na falta da flag, só o valor exato "1" da variável
  * ativa o modo (presente/vazio/"0"/outros textos não ativam). */

@@ -89,6 +89,7 @@ typedef struct {
     int       first_sample;
 
     mem_t mem;
+    unsigned long xmx_kb;   /* -Xmx do cmdline; 0 = desconhecido */
     int   heap_ctr;
 
     thr_t thr;

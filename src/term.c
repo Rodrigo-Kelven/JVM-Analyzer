@@ -5,6 +5,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <termios.h>
@@ -75,6 +76,28 @@ static void fb_put_raw(const char *data, int len) {
     }
 }
 
+static int g_ascii = 0, g_nocolor = 0;
+
+void term_ui_init(int ascii) {
+    const char *nc = getenv("NO_COLOR"), *tm = getenv("TERM");
+    g_ascii   = ascii;
+    g_nocolor = (nc && *nc) || (tm && strcmp(tm, "dumb") == 0);
+}
+
+/* Fallback ASCII para os glifos Unicode usados pela TUI (--ascii). */
+static const char *ascii_for(unsigned int cp) {
+    static char one[2];
+    if (cp >= 0x2581 && cp <= 0x2587) { one[0] = "_.,:-=+"[cp - 0x2581]; return one; }
+    switch (cp) {
+    case 0x2588: return "#";  case 0x2591: return ".";
+    case 0x2500: return "-";  case 0x2502: return "|";
+    case 0x256D: case 0x256E: case 0x2570: case 0x256F: return "+";
+    case 0x2713: return "v";  case 0x2014: return "-";
+    case 0x2190: return "<";  case 0x25B2: return "^"; case 0x25BC: return "v";
+    }
+    return "?";
+}
+
 void fb_write(const char *s) {
     /* Limita escrita visível por linha a g_term_w; trunca com segurança e
      * sinaliza overflow. Sequências ANSI são preservadas. */
@@ -108,7 +131,8 @@ void fb_write(const char *s) {
             p += seq_len;
             continue;
         }
-        fb_put_raw((const char *)p, seq_len);
+        if (g_ascii && cp >= 0x80) fb_put_raw(ascii_for(cp), 1);
+        else fb_put_raw((const char *)p, seq_len);
         g_fb_col += wch;
         p += seq_len;
     }
@@ -124,8 +148,8 @@ void fb_printf(const char *fmt, ...) {
 
 /* Position cursor (0-based row/col → ANSI 1-based) */
 void fb_move(int row, int col) { g_fb_col = col < 0 ? 0 : col; fb_printf("\033[%d;%dH", row+1, col+1); }
-void fb_fg(int n)   { fb_printf("\033[38;5;%dm", n); }
-void fb_bg(int n)   { fb_printf("\033[48;5;%dm", n); }
+void fb_fg(int n)   { if (!g_nocolor) fb_printf("\033[38;5;%dm", n); }
+void fb_bg(int n)   { if (g_nocolor) fb_write("\033[7m"); else fb_printf("\033[48;5;%dm", n); }
 void fb_bold(void)  { fb_write("\033[1m"); }
 void fb_reset_attr(void) { fb_write("\033[0m"); }
 void fb_eol(void)   { fb_write("\033[K"); }  /* erase to end of line */

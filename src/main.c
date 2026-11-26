@@ -61,13 +61,17 @@ int main(int argc, char *argv[]) {
     term_signals_init();
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
 
-    gc_sim_set_disabled(gc_sim_disabled(argc, argv));
+    gc_sim_set_disabled(!gc_sim_opt_in(argc, argv) || gc_sim_disabled(argc, argv));
+    int ascii = 0;
+    for (int i = 1; i < argc; i++)
+        if (argv[i] && strcmp(argv[i], "--ascii") == 0) ascii = 1;
+    term_ui_init(ascii || (getenv("JVMA_ASCII") && strcmp(getenv("JVMA_ASCII"), "1") == 0));
     export_set_notify(export_notify_cb);
 
     int pid = 0;
     int ipid = 0, idir = 0; /* argumentos posicionais, ignorando a flag */
     for (int i = 1; i < argc; i++) {
-        if (argv[i] != NULL && strcmp(argv[i], "--no-sim-gc") == 0) continue;
+        if (argv[i] != NULL && strncmp(argv[i], "--", 2) == 0) continue; /* flags */
         if (ipid == 0) ipid = i;
         else if (idir == 0) idir = i;
     }
@@ -109,6 +113,7 @@ int main(int argc, char *argv[]) {
     g_jvm.heap_ctr = 4; /* triggers heap scan on first update */
     proc_read_cmdline(pid, g_jvm.cmdline, sizeof(g_jvm.cmdline));
     proc_detect_gc(pid, g_jvm.gc_type, sizeof(g_jvm.gc_type));
+    g_jvm.xmx_kb = parse_xmx_kb(g_jvm.cmdline);
     proc_read_memtotal(&g_jvm.mem);
     ensure_export_dir();
 

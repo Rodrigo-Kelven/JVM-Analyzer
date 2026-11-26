@@ -77,3 +77,19 @@ int parse_pid_arg(const char *s, int *out)
     *out = (int)v;
     return 0;
 }
+
+unsigned long parse_xmx_kb(const char *cmdline)
+{
+    const char *p = strstr(cmdline, "-Xmx");
+    if (!p) return 0;
+    char *end;
+    unsigned long v = strtoul(p + 4, &end, 10);
+    if (end == p + 4) return 0;
+    switch (*end) {
+    case 'k': case 'K': return v;
+    case 'g': case 'G': return v * 1024UL * 1024UL;
+    case 't': case 'T': return v * 1024UL * 1024UL * 1024UL;
+    case 'm': case 'M': return v * 1024UL;
+    default:            return v / 1024UL;   /* bytes */
+    }
+}

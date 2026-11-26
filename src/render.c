@@ -2,6 +2,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "gc_sim.h"
 #include "render.h"
 #include "ring.h"
 #include "term.h"
@@ -153,6 +154,28 @@ int panel_header_bar(const jvm_t *j, int row) {
     return row + 1;
 }
 
+/* Linha "60s <sparkline> min-max<unit> <tendência>": a escala e a direção
+ * (▲ subindo, ▼ caindo, = estável) tornam a sparkline legível. */
+static void draw_spark_row(const ring_t *r, int row, int col, int w,
+                           int color, const char *unit)
+{
+    char spark[HISTORY_LEN*4+8] = {0};
+    int sw = w - 26; if (sw < 10) sw = 10;
+    ring_sparkline(r, spark, sw);
+    draw_sides(row, col, w);
+    fb_ctext(row, col+2, CL_LABEL, 0, "60s ");
+    fb_move(row, col+6); fb_fg(color); fb_write(spark); fb_reset_attr();
+
+    double mn, mx, first, last;
+    if (ring_stats(r, sw, &mn, &mx, &first, &last) > 0) {
+        double d = last - first, eps = 0.02 * (mx > 1.0 ? mx : 1.0);
+        const char *arrow = d > eps ? "\xe2\x96\xb2" : (d < -eps ? "\xe2\x96\xbc" : "=");
+        fb_move(row, col + w - 19); fb_fg(CL_DIM);
+        fb_printf("%.0f-%.0f%s ", mn, mx, unit);
+        fb_fg(CL_VALUE); fb_write(arrow); fb_reset_attr();
+    }
+}
+
 int panel_cpu(const jvm_t *j, int row, int col, int w) {
     draw_panel_hdr(row, col, w, "CPU"); row++;
     int bw = w - 28; if (bw < 6) bw = 6;
@@ -162,13 +185,8 @@ int panel_cpu(const jvm_t *j, int row, int col, int w) {
     draw_bar(row, col+9, bw, j->cpu_pct, TH_CPU_W, TH_CPU_C);
     row++;
 
-    char spark[HISTORY_LEN*4+8] = {0};
-    ring_sparkline(&j->h_cpu, spark, w-12);
-    draw_sides(row, col, w);
-    fb_ctext(row, col+2, CL_LABEL, 0, "60s ");
-    fb_move(row, col+6);
-    fb_fg(pct_color(j->cpu_pct, TH_CPU_W, TH_CPU_C));
-    fb_write(spark); fb_reset_attr();
+    draw_spark_row(&j->h_cpu, row, col, w,
+                   pct_color(j->cpu_pct, TH_CPU_W, TH_CPU_C), "%");
     row++;
 
     draw_panel_ftr(row, col, w);
@@ -186,7 +204,9 @@ int panel_memory(const jvm_t *j, int row, int col, int w) {
     double anon_mb = j->mem.anon_kb / 1024.0;
     double tot_mb  = j->mem.mem_total_kb / 1024.0;
     double rss_pct = tot_mb > 0 ? rss_mb  / tot_mb * 100.0 : 0.0;
-    double hp_pct  = tot_mb > 0 ? heap_mb / (tot_mb * 0.25) * 100.0 : 0.0;
+    /* Heap~ relativo ao -Xmx quando conhecido; senão, 25% da RAM (heurística). */
+    double hp_base = j->xmx_kb ? j->xmx_kb / 1024.0 : tot_mb * 0.25;
+    double hp_pct  = hp_base > 0 ? heap_mb / hp_base * 100.0 : 0.0;
     if (hp_pct > 100) hp_pct = 100;
 
     char vmb[18];
@@ -201,7 +221,7 @@ int panel_memory(const jvm_t *j, int row, int col, int w) {
 
     /* Heap~ bar */
     draw_sides(row, col, w);
-    fb_ctext(row, col+2, CL_LABEL, 0, "Heap~  ");
+    fb_ctext(row, col+2, CL_LABEL, 0, j->xmx_kb ? "Heap/Xmx" : "Heap~  ");
     draw_bar(row, col+9, bw, hp_pct, 70.0, 90.0);
     fmt_mb(heap_mb, vmb, sizeof(vmb));
     fb_cprintf(row, col+9+bw+10, CL_VALUE, 1, "%8s", vmb);
@@ -224,11 +244,7 @@ int panel_memory(const jvm_t *j, int row, int col, int w) {
     row++;
 
     /* RSS sparkline */
-    char spark[HISTORY_LEN*4+8] = {0};
-    ring_sparkline(&j->h_rss, spark, w-12);
-    draw_sides(row, col, w);
-    fb_ctext(row, col+2, CL_LABEL, 0, "60s ");
-    fb_move(row, col+6); fb_fg(CL_VALUE); fb_write(spark); fb_reset_attr();
+    draw_spark_row(&j->h_rss, row, col, w, CL_VALUE, "MB");
     row++;
 
     /* Note */
@@ -260,7 +276,7 @@ int panel_threads(const jvm_t *j, int row, int col, int w) {
     fb_cprintf(row, col+17, CL_LABEL, 0, "Virtual ");
     fb_cprintf(row, col+26, CL_ACCENT,1, "%-5d", j->thr.virt);
     fb_cprintf(row, col+32, CL_LABEL, 0, "Daemon  ");
-    fb_cprintf(row, col+41, CL_DIM,   0, "%-5d", j->thr.daemon);
+    fb_cprintf(row, col+41, CL_DIM,   0, "n/a  "); /* /proc não expõe daemon */
     row++;
 
     /* Runnable | Waiting | Blocked */
@@ -283,11 +299,7 @@ int panel_threads(const jvm_t *j, int row, int col, int w) {
     row++;
 
     /* Thread sparkline */
-    char spark[HISTORY_LEN*4+8] = {0};
-    ring_sparkline(&j->h_threads, spark, w-12);
-    draw_sides(row, col, w);
-    fb_ctext(row, col+2, CL_LABEL,  0, "60s ");
-    fb_move(row, col+6); fb_fg(CL_ACCENT); fb_write(spark); fb_reset_attr();
+    draw_spark_row(&j->h_threads, row, col, w, CL_ACCENT, "");
     row++;
 
     draw_panel_ftr(row, col, w);
@@ -303,9 +315,13 @@ int panel_gc_fd(const jvm_t *j, int row, int col, int w) {
     fb_ctext(row, col+2, CL_LABEL, 0, "Collector ");
     fb_cprintf(row, col+12, CL_ACCENT, 1, "%-14s", j->gc_type);
     fb_ctext(row, col+27, CL_LABEL, 0, "Pause ");
-    int cpg = j->gc_pause_ms >= TH_GC_C_MS ? CL_CRIT : (j->gc_pause_ms >= TH_GC_W_MS ? CL_WARN : CL_HEALTHY);
-    fb_cprintf(row, col+33, cpg, 1, "%6.1fms", j->gc_pause_ms);
-    fb_ctext(row, col+41, CL_DIM, 0, " (est)");
+    if (gc_sim_enabled()) {
+        /* valor simulado: nunca em cor de "saúde" */
+        fb_cprintf(row, col+33, CL_DIM, 0, "%6.1fms", j->gc_pause_ms);
+        fb_ctext(row, col+41, CL_WARN, 0, " (simulado)");
+    } else {
+        fb_ctext(row, col+33, CL_DIM, 0, "   n/a  (use --sim-gc p/ demo)");
+    }
     row++;
 
     /* FD bar */
@@ -363,9 +379,17 @@ void draw_footer(const jvm_t *j, const int *itvl_ms) {
         fb_fg(CL_OK); fb_bold();
         if (avail > 0) fb_printf("%.*s", avail, notify_message());
     } else {
+        static const char *keys[][2] = {
+            {"q","quit"}, {"p",NULL}, {"e","json"}, {"c","csv"}, {"h","help"}, {"+/-","speed"}};
+        fb_write(" ");
+        for (int i = 0; i < 6; i++) {
+            fb_fg(CL_ACCENT); fb_bold(); fb_write(keys[i][0]); fb_reset_attr();
+            fb_fg(CL_DIM);
+            fb_printf(" %s  ", keys[i][1] ? keys[i][1] : (j->paused ? "resume" : "pause"));
+            fb_reset_attr();
+        }
         fb_fg(CL_DIM);
-        fb_printf(" [Q]Quit  [P]%s  [E]JSON  [C]CSV  [H]Help  [+/-]Speed  Int:%ds",
-                  j->paused ? "Resume" : "Pause", *itvl_ms/1000);
+        fb_printf("interval %.1fs", *itvl_ms / 1000.0);
     }
     fb_eol();
     fb_reset_attr();
@@ -480,11 +504,9 @@ void render_dashboard(const jvm_t *j, const int *itvl_ms) {
     int row = panel_header_bar(j, 0);
     int footer_row = h - 1;
     int alerts_h = panel_h_alerts(j);
-    /* orçamento: footer sempre na última linha; painéis não invadem footer.
-     * row_limit atende orçamento estrito do layout (0 alertas <=14, 5 alertas <=10). */
-    int row_limit = (j->nalerts == 0) ? 14 : 10;
+    /* orçamento: footer sempre na última linha; painéis usam toda a altura
+     * restante, sem invadir o footer. */
     int content_max = footer_row - 1;
-    if (content_max > row_limit) content_max = row_limit;
     /* ALERTS tem prioridade: reserva suas linhas antes de aceitar painéis. */
     int limit = content_max - alerts_h + 1;
 

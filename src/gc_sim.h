@@ -3,7 +3,9 @@
 
 #include "jvma_types.h"
 
-/* GC simulado é o padrão; --no-sim-gc / JVMA_NO_SIM_GC=1 desligam o random walk. */
+/* GC simulado é opt-in: --sim-gc / JVMA_SIM_GC=1 ligam o random walk;
+ * --no-sim-gc / JVMA_NO_SIM_GC=1 desligam e prevalecem. */
+int  gc_sim_opt_in(int argc, char **argv);
 void gc_sim_set_disabled(int disabled);
 int  gc_sim_enabled(void);
 

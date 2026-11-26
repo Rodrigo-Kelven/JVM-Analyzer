@@ -22,6 +22,9 @@ void fb_ctext(int row, int col, int fg, int bold, const char *s);
 void fb_cprintf(int row, int col, int fg, int bold, const char *fmt, ...);
 void fb_flush(void);
 
+/* --ascii (glifos ASCII); NO_COLOR/TERM=dumb desligam cores. Chamar uma vez. */
+void term_ui_init(int ascii);
+
 /* Texto simples (menu de descoberta, mensagens de saída): mantém printf()
  * fora dos módulos que não são donos de stdout. */
 void term_printf(const char *fmt, ...);
